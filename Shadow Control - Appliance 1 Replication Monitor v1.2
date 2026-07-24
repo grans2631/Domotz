@@ -1,0 +1,2067 @@
+/**
+ * Domotz Custom Integration
+ * Name: Shadow Control - Appliance 1 Monitor
+ * Version: 1.2.0
+ *
+ * Description:
+ * Retrieves current ShadowControl endpoint status and evaluates
+ * ImageManager replication jobs for suspected replication failures.
+ *
+ * Variables/top section retained:
+ * - Replication Health
+ * - Replication Issue Count
+ * - Replication Job Count
+ * - ShadowControl Endpoint Count
+ * - Replication Stale Threshold
+ * - Replication Issue Endpoint Count
+ * - Endpoints With Replication Data
+ *
+ * Bottom table:
+ * - ID: Device name
+ * - Status: Healthy or Failed
+ *
+ * Status translation:
+ * - Replication Health equals "Healthy" => Healthy
+ * - Any other Replication Health value => Failed
+ *
+ * Required parameters:
+ * - Appliance
+ * - Token
+ *
+ * Optional parameter:
+ * - ReplicationStaleHours
+ */
+ 
+/**
+ * @description ShadowControl appliance base URL
+ * @type TEXT
+ */
+var Appliance =
+    D.getParameter('Appliance');
+ 
+/**
+ * @description ShadowControl Report API token
+ * @type SECRET_TEXT
+ */
+var Token =
+    D.getParameter('Token');
+ 
+/**
+ * @description Hours before queued replication is considered stale
+ * @type NUMBER
+ */
+var ReplicationStaleHours =
+    D.getParameter('ReplicationStaleHours');
+ 
+var HARDCODED_APPLIANCE = '';
+ 
+var DEFAULT_STALE_HOURS = 8;
+var STATUS_API_PATH = '/api/reports/status/';
+var REQUEST_TIMEOUT_MS = 60000;
+var MAX_TABLE_VALUE_LENGTH = 500;
+var MAX_RECORD_ID_LENGTH = 50;
+ 
+/*
+ * Basic value helpers
+ */
+ 
+function isArray(value) {
+    return Array.isArray(value);
+}
+ 
+function isObject(value) {
+    return (
+        value !== null &&
+        typeof value === 'object' &&
+        !isArray(value)
+    );
+}
+ 
+function isEmpty(value) {
+    return (
+        value === null ||
+        typeof value === 'undefined' ||
+        value === ''
+    );
+}
+ 
+function trimText(value) {
+    if (isEmpty(value)) {
+        return '';
+    }
+ 
+    return String(value).replace(
+        /^\s+|\s+$/g,
+        ''
+    );
+}
+ 
+function safeText(value) {
+    if (isEmpty(value)) {
+        return 'N/A';
+    }
+ 
+    if (typeof value === 'boolean') {
+        return value
+            ? 'True'
+            : 'False';
+    }
+ 
+    if (isArray(value)) {
+        if (value.length === 0) {
+            return 'N/A';
+        }
+ 
+        return value.join(', ');
+    }
+ 
+    if (isObject(value)) {
+        try {
+            return JSON.stringify(value);
+        } catch (error) {
+            return '[Object]';
+        }
+    }
+ 
+    return String(value);
+}
+ 
+function cleanDisplayText(value) {
+    var text =
+        safeText(value);
+ 
+    if (text === 'N/A') {
+        return text;
+    }
+ 
+    text =
+        text
+            .replace(
+                /[\r\n\t]+/g,
+                ' '
+            )
+            .replace(
+                /\s+/g,
+                ' '
+            )
+            .replace(
+                /^\s+|\s+$/g,
+                ''
+            );
+ 
+    return text || 'N/A';
+}
+ 
+function tableText(value) {
+    return cleanDisplayText(
+        value
+    ).substring(
+        0,
+        MAX_TABLE_VALUE_LENGTH
+    );
+}
+ 
+function getObjectKeys(value) {
+    var keys = [];
+    var key;
+ 
+    if (!isObject(value)) {
+        return keys;
+    }
+ 
+    for (key in value) {
+        if (
+            Object.prototype.hasOwnProperty.call(
+                value,
+                key
+            )
+        ) {
+            keys.push(key);
+        }
+    }
+ 
+    return keys;
+}
+ 
+function getFirstValue(
+    source,
+    propertyNames
+) {
+    var i;
+    var value;
+ 
+    if (!isObject(source)) {
+        return null;
+    }
+ 
+    for (
+        i = 0;
+        i < propertyNames.length;
+        i++
+    ) {
+        value =
+            source[
+                propertyNames[i]
+            ];
+ 
+        if (!isEmpty(value)) {
+            return value;
+        }
+    }
+ 
+    return null;
+}
+ 
+function safeInteger(
+    value,
+    fallback
+) {
+    var converted;
+ 
+    if (isEmpty(value)) {
+        return fallback;
+    }
+ 
+    converted =
+        parseInt(
+            value,
+            10
+        );
+ 
+    if (isNaN(converted)) {
+        return fallback;
+    }
+ 
+    return converted;
+}
+ 
+function getValueCount(value) {
+    if (
+        value === null ||
+        typeof value === 'undefined' ||
+        value === '' ||
+        value === false ||
+        value === 0
+    ) {
+        return 0;
+    }
+ 
+    if (isArray(value)) {
+        return value.length;
+    }
+ 
+    if (isObject(value)) {
+        return getObjectKeys(
+            value
+        ).length;
+    }
+ 
+    return 1;
+}
+ 
+function roundTwo(value) {
+    return Math.round(
+        value * 100
+    ) / 100;
+}
+ 
+/*
+ * Collection normalization
+ */
+ 
+function looksLikeFolder(value) {
+    if (!isObject(value)) {
+        return false;
+    }
+ 
+    return (
+        typeof value.path !== 'undefined' ||
+        typeof value.folder_path !== 'undefined' ||
+        typeof value.folderPath !== 'undefined' ||
+        typeof value.replication_jobs !== 'undefined' ||
+        typeof value.replicationJobs !== 'undefined' ||
+        typeof value.replications !== 'undefined'
+    );
+}
+ 
+function looksLikeReplicationJob(value) {
+    if (!isObject(value)) {
+        return false;
+    }
+ 
+    return (
+        typeof value.name !== 'undefined' ||
+        typeof value.job_name !== 'undefined' ||
+        typeof value.jobName !== 'undefined' ||
+        typeof value.queued_files !== 'undefined' ||
+        typeof value.queuedFiles !== 'undefined' ||
+        typeof value.last_success_time !== 'undefined' ||
+        typeof value.lastSuccessTime !== 'undefined' ||
+        typeof value.target_location_type !== 'undefined' ||
+        typeof value.targetLocationType !== 'undefined' ||
+        typeof value.errors !== 'undefined' ||
+        typeof value.warnings !== 'undefined'
+    );
+}
+ 
+/**
+ * Supports arrays, single objects, and dictionaries keyed
+ * by folder ID or job ID.
+ */
+function normalizeCollection(
+    value,
+    detector
+) {
+    var results = [];
+    var keys;
+    var i;
+    var child;
+ 
+    if (
+        value === null ||
+        typeof value === 'undefined'
+    ) {
+        return results;
+    }
+ 
+    if (isArray(value)) {
+        return value;
+    }
+ 
+    if (!isObject(value)) {
+        return [value];
+    }
+ 
+    if (
+        detector &&
+        detector(value)
+    ) {
+        return [value];
+    }
+ 
+    keys =
+        getObjectKeys(value);
+ 
+    for (
+        i = 0;
+        i < keys.length;
+        i++
+    ) {
+        child =
+            value[
+                keys[i]
+            ];
+ 
+        if (
+            child !== null &&
+            typeof child !== 'undefined'
+        ) {
+            results.push(child);
+        }
+    }
+ 
+    return results;
+}
+ 
+/*
+ * Configuration
+ */
+ 
+function getStaleHours() {
+    var staleHours =
+        Number(
+            ReplicationStaleHours
+        );
+ 
+    if (
+        isNaN(staleHours) ||
+        staleHours <= 0
+    ) {
+        return DEFAULT_STALE_HOURS;
+    }
+ 
+    return staleHours;
+}
+ 
+function getApplianceValue() {
+    var hardcoded =
+        trimText(
+            HARDCODED_APPLIANCE
+        );
+ 
+    if (hardcoded) {
+        return hardcoded;
+    }
+ 
+    return trimText(
+        Appliance
+    );
+}
+ 
+function parseAppliance(value) {
+    var applianceText;
+    var match;
+    var protocol;
+    var host;
+    var urlHost;
+    var port;
+    var basePath;
+    var requestPath;
+    var baseUrl;
+    var includePort;
+ 
+    applianceText =
+        trimText(value);
+ 
+    if (!applianceText) {
+        return null;
+    }
+ 
+    if (
+        !/^[a-z][a-z0-9+.-]*:\/\//i.test(
+            applianceText
+        )
+    ) {
+        applianceText =
+            'https://' +
+            applianceText;
+    }
+ 
+    match =
+        applianceText.match(
+            /^(https?):\/\/(\[[^\]]+\]|[^\/:?#]+)(?::([0-9]+))?([^?#]*)?(?:\?[^#]*)?(?:#.*)?$/i
+        );
+ 
+    if (!match) {
+        return null;
+    }
+ 
+    protocol =
+        String(
+            match[1]
+        ).toLowerCase();
+ 
+    host =
+        String(
+            match[2]
+        );
+ 
+    if (
+        host.charAt(0) === '[' &&
+        host.charAt(
+            host.length - 1
+        ) === ']'
+    ) {
+        host =
+            host.substring(
+                1,
+                host.length - 1
+            );
+    }
+ 
+    if (match[3]) {
+        port =
+            parseInt(
+                match[3],
+                10
+            );
+    } else {
+        port =
+            protocol === 'https'
+                ? 443
+                : 80;
+    }
+ 
+    if (
+        isNaN(port) ||
+        port < 1 ||
+        port > 65535
+    ) {
+        return null;
+    }
+ 
+    basePath =
+        match[4] || '';
+ 
+    basePath =
+        basePath.replace(
+            /\/+$/g,
+            ''
+        );
+ 
+    if (
+        /\/api\/reports\/status$/i.test(
+            basePath
+        )
+    ) {
+        basePath =
+            basePath.replace(
+                /\/api\/reports\/status$/i,
+                ''
+            );
+    }
+ 
+    requestPath =
+        basePath +
+        STATUS_API_PATH;
+ 
+    urlHost =
+        host.indexOf(':') !== -1
+            ? '[' + host + ']'
+            : host;
+ 
+    includePort =
+        !(
+            protocol === 'https' &&
+            port === 443
+        ) &&
+        !(
+            protocol === 'http' &&
+            port === 80
+        );
+ 
+    baseUrl =
+        protocol +
+        '://' +
+        urlHost +
+        (
+            includePort
+                ? ':' + String(port)
+                : ''
+        ) +
+        basePath;
+ 
+    return {
+        protocol:
+            protocol,
+ 
+        host:
+            host,
+ 
+        port:
+            port,
+ 
+        requestPath:
+            requestPath,
+ 
+        baseUrl:
+            baseUrl
+    };
+}
+ 
+function getConfiguration() {
+    var applianceValue;
+    var configuration;
+ 
+    applianceValue =
+        getApplianceValue();
+ 
+    if (!applianceValue) {
+        console.error(
+            'Missing Appliance parameter'
+        );
+ 
+        return {
+            error:
+                'configuration'
+        };
+    }
+ 
+    if (
+        !trimText(Token)
+    ) {
+        console.error(
+            'Missing Token parameter'
+        );
+ 
+        return {
+            error:
+                'authentication'
+        };
+    }
+ 
+    configuration =
+        parseAppliance(
+            applianceValue
+        );
+ 
+    if (!configuration) {
+        console.error(
+            'The Appliance parameter is not a valid URL or hostname'
+        );
+ 
+        return {
+            error:
+                'configuration'
+        };
+    }
+ 
+    configuration.token =
+        Token;
+ 
+    configuration.staleHours =
+        getStaleHours();
+ 
+    return configuration;
+}
+ 
+/*
+ * HTTP and failure handling
+ */
+ 
+function isTimeoutError(error) {
+    var errorText;
+ 
+    if (!error) {
+        return false;
+    }
+ 
+    errorText =
+        String(
+            error.message ||
+            error
+        ).toLowerCase();
+ 
+    return (
+        errorText.indexOf(
+            'timeout'
+        ) !== -1 ||
+        errorText.indexOf(
+            'timed out'
+        ) !== -1 ||
+        errorText.indexOf(
+            'etimedout'
+        ) !== -1
+    );
+}
+ 
+function failDriver(errorType) {
+    if (
+        errorType ===
+        'authentication'
+    ) {
+        D.failure(
+            D.errorType.AUTHENTICATION_ERROR
+        );
+ 
+        return;
+    }
+ 
+    if (
+        errorType ===
+        'parsing'
+    ) {
+        D.failure(
+            D.errorType.PARSING_ERROR
+        );
+ 
+        return;
+    }
+ 
+    if (
+        errorType ===
+        'timeout'
+    ) {
+        D.failure(
+            D.errorType.TIMEOUT_ERROR
+        );
+ 
+        return;
+    }
+ 
+    if (
+        errorType ===
+        'resource'
+    ) {
+        D.failure(
+            D.errorType.RESOURCE_UNAVAILABLE
+        );
+ 
+        return;
+    }
+ 
+    D.failure(
+        D.errorType.GENERIC_ERROR
+    );
+}
+ 
+function getShadowControlStatus(
+    configuration,
+    callback
+) {
+    var shadowControl;
+    var options;
+    var requestStart;
+ 
+    shadowControl =
+        D.createExternalDevice(
+            configuration.host
+        );
+ 
+    options = {
+        url:
+            configuration.requestPath,
+ 
+        protocol:
+            configuration.protocol,
+ 
+        port:
+            configuration.port,
+ 
+        rejectUnauthorized:
+            false,
+ 
+        timeout:
+            REQUEST_TIMEOUT_MS,
+ 
+        headers: {
+            'Accept':
+                'application/json',
+ 
+            'CMD_TOKEN':
+                configuration.token
+        }
+    };
+ 
+    requestStart =
+        new Date().getTime();
+ 
+    console.info(
+        'Requesting ShadowControl status from ' +
+        configuration.baseUrl +
+        STATUS_API_PATH
+    );
+ 
+    shadowControl.http.get(
+        options,
+        function (
+            error,
+            response,
+            body
+        ) {
+            var statusCode;
+            var parsedBody;
+            var elapsed;
+ 
+            elapsed =
+                new Date().getTime() -
+                requestStart;
+ 
+            console.info(
+                'ShadowControl API request completed in ' +
+                String(elapsed) +
+                ' ms'
+            );
+ 
+            if (error) {
+                console.error(
+                    'ShadowControl HTTP error: ' +
+                    String(
+                        error.message ||
+                        error
+                    )
+                );
+ 
+                callback(
+                    isTimeoutError(error)
+                        ? 'timeout'
+                        : 'resource',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (!response) {
+                console.error(
+                    'ShadowControl returned no HTTP response'
+                );
+ 
+                callback(
+                    'resource',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            statusCode =
+                Number(
+                    response.statusCode
+                );
+ 
+            if (
+                statusCode === 401 ||
+                statusCode === 403
+            ) {
+                console.error(
+                    'ShadowControl authentication failed: HTTP ' +
+                    String(statusCode)
+                );
+ 
+                callback(
+                    'authentication',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (
+                statusCode === 408
+            ) {
+                callback(
+                    'timeout',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (
+                statusCode === 404 ||
+                statusCode >= 500
+            ) {
+                console.error(
+                    'ShadowControl service unavailable: HTTP ' +
+                    String(statusCode)
+                );
+ 
+                callback(
+                    'resource',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (
+                isNaN(statusCode) ||
+                statusCode < 200 ||
+                statusCode >= 300
+            ) {
+                console.error(
+                    'ShadowControl returned HTTP ' +
+                    String(statusCode)
+                );
+ 
+                callback(
+                    'generic',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            try {
+                if (
+                    typeof body === 'string'
+                ) {
+                    if (
+                        trimText(body) === ''
+                    ) {
+                        console.error(
+                            'ShadowControl returned an empty response body'
+                        );
+ 
+                        callback(
+                            'parsing',
+                            null
+                        );
+ 
+                        return;
+                    }
+ 
+                    parsedBody =
+                        JSON.parse(body);
+                } else if (
+                    isObject(body)
+                ) {
+                    parsedBody =
+                        body;
+                } else {
+                    console.error(
+                        'ShadowControl returned an unsupported response body'
+                    );
+ 
+                    callback(
+                        'parsing',
+                        null
+                    );
+ 
+                    return;
+                }
+            } catch (parseError) {
+                console.error(
+                    'Unable to parse ShadowControl JSON: ' +
+                    String(
+                        parseError.message ||
+                        parseError
+                    )
+                );
+ 
+                callback(
+                    'parsing',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (
+                !isObject(parsedBody) ||
+                getObjectKeys(
+                    parsedBody
+                ).length === 0
+            ) {
+                console.error(
+                    'ShadowControl returned no endpoint data'
+                );
+ 
+                callback(
+                    'parsing',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            callback(
+                null,
+                parsedBody
+            );
+        }
+    );
+}
+ 
+/*
+ * Date and replication evaluation
+ */
+ 
+function parseDateValue(value) {
+    var milliseconds;
+ 
+    if (isEmpty(value)) {
+        return null;
+    }
+ 
+    milliseconds =
+        Date.parse(
+            String(value)
+        );
+ 
+    if (isNaN(milliseconds)) {
+        return null;
+    }
+ 
+    return new Date(
+        milliseconds
+    );
+}
+ 
+function getAgeHours(value) {
+    var parsedDate;
+    var ageMilliseconds;
+    var ageHours;
+ 
+    parsedDate =
+        parseDateValue(value);
+ 
+    if (!parsedDate) {
+        return null;
+    }
+ 
+    ageMilliseconds =
+        new Date().getTime() -
+        parsedDate.getTime();
+ 
+    ageHours =
+        ageMilliseconds /
+        3600000;
+ 
+    if (ageHours < 0) {
+        ageHours = 0;
+    }
+ 
+    return roundTwo(
+        ageHours
+    );
+}
+ 
+function getReplicationJobName(job) {
+    return cleanDisplayText(
+        getFirstValue(
+            job,
+            [
+                'name',
+                'job_name',
+                'jobName'
+            ]
+        ) ||
+        'Unnamed Replication Job'
+    );
+}
+ 
+function getFolderPath(folder) {
+    return cleanDisplayText(
+        getFirstValue(
+            folder,
+            [
+                'path',
+                'folder_path',
+                'folderPath',
+                'name'
+            ]
+        ) ||
+        'Managed Folder'
+    );
+}
+ 
+function getLastSuccess(job) {
+    return getFirstValue(
+        job,
+        [
+            'last_success_time',
+            'lastSuccessTime',
+            'last_success',
+            'lastSuccess'
+        ]
+    );
+}
+ 
+function getQueuedFiles(job) {
+    return safeInteger(
+        getFirstValue(
+            job,
+            [
+                'queued_files',
+                'queuedFiles',
+                'queue_count',
+                'queueCount'
+            ]
+        ),
+        0
+    );
+}
+ 
+function getTargetLocation(job) {
+    return cleanDisplayText(
+        getFirstValue(
+            job,
+            [
+                'target_location_type',
+                'targetLocationType',
+                'target_location',
+                'targetLocation',
+                'destination'
+            ]
+        )
+    );
+}
+ 
+function testReplicationIssue(
+    endpoint,
+    replicationJob,
+    staleHours
+) {
+    var reasons = [];
+    var endpointStatus;
+    var queuedFiles;
+    var lastSuccess;
+    var lastSuccessDate;
+    var lastSuccessAgeHours;
+    var errorCount;
+    var warningCount;
+ 
+    endpointStatus =
+        trimText(
+            endpoint.status
+        );
+ 
+    queuedFiles =
+        getQueuedFiles(
+            replicationJob
+        );
+ 
+    lastSuccess =
+        getLastSuccess(
+            replicationJob
+        );
+ 
+    lastSuccessDate =
+        parseDateValue(
+            lastSuccess
+        );
+ 
+    lastSuccessAgeHours =
+        getAgeHours(
+            lastSuccess
+        );
+ 
+    errorCount =
+        getValueCount(
+            getFirstValue(
+                replicationJob,
+                [
+                    'errors',
+                    'error'
+                ]
+            )
+        );
+ 
+    warningCount =
+        getValueCount(
+            getFirstValue(
+                replicationJob,
+                [
+                    'warnings',
+                    'warning'
+                ]
+            )
+        );
+ 
+    if (
+        /^(critical|broken)$/i.test(
+            endpointStatus
+        )
+    ) {
+        reasons.push(
+            'Endpoint status is ' +
+            endpointStatus
+        );
+    }
+ 
+    if (
+        errorCount > 0
+    ) {
+        reasons.push(
+            'Replication job has ' +
+            String(errorCount) +
+            ' error(s)'
+        );
+    }
+ 
+    if (
+        warningCount > 0
+    ) {
+        reasons.push(
+            'Replication job has ' +
+            String(warningCount) +
+            ' warning(s)'
+        );
+    }
+ 
+    if (
+        queuedFiles > 0 &&
+        lastSuccessDate === null
+    ) {
+        reasons.push(
+            'Queued files present (' +
+            String(queuedFiles) +
+            ') and no last success is recorded'
+        );
+    }
+ 
+    if (
+        queuedFiles > 0 &&
+        lastSuccessAgeHours !== null &&
+        lastSuccessAgeHours >= staleHours
+    ) {
+        reasons.push(
+            'Queued files present (' +
+            String(queuedFiles) +
+            ') and last success is stale (' +
+            String(lastSuccessAgeHours) +
+            ' hours old)'
+        );
+    }
+ 
+    if (
+        queuedFiles > 0 &&
+        /^(critical|broken)$/i.test(
+            endpointStatus
+        )
+    ) {
+        reasons.push(
+            'Queued files present (' +
+            String(queuedFiles) +
+            ') on endpoint in ' +
+            endpointStatus +
+            ' state'
+        );
+    }
+ 
+    return {
+        isIssue:
+            reasons.length > 0,
+ 
+        queuedFiles:
+            queuedFiles,
+ 
+        lastSuccess:
+            lastSuccess,
+ 
+        lastSuccessAgeHours:
+            lastSuccessAgeHours,
+ 
+        errorCount:
+            errorCount,
+ 
+        warningCount:
+            warningCount
+    };
+}
+ 
+/*
+ * Collect one aggregated result per endpoint
+ */
+ 
+function collectReplicationResults(
+    status,
+    staleHours
+) {
+    var endpointKeys =
+        getObjectKeys(status);
+ 
+    var rows = [];
+ 
+    var endpointCount = 0;
+    var dataEndpointCount = 0;
+    var issueEndpointCount = 0;
+    var replicationJobCount = 0;
+    var issueCount = 0;
+    var duplicateJobCount = 0;
+ 
+    var endpointIndex;
+    var endpointKey;
+    var endpoint;
+    var folders;
+    var folderIndex;
+    var folder;
+    var folderPath;
+    var jobs;
+    var jobIndex;
+    var job;
+    var jobName;
+    var targetLocation;
+    var signature;
+    var evaluation;
+ 
+    var seenJobs;
+    var endpointJobCount;
+    var endpointIssueJobCount;
+ 
+    for (
+        endpointIndex = 0;
+        endpointIndex < endpointKeys.length;
+        endpointIndex++
+    ) {
+        endpointKey =
+            endpointKeys[
+                endpointIndex
+            ];
+ 
+        endpoint =
+            status[
+                endpointKey
+            ];
+ 
+        if (!isObject(endpoint)) {
+            continue;
+        }
+ 
+        endpointCount =
+            endpointCount + 1;
+ 
+        if (
+            !endpoint.imagemanager ||
+            !endpoint.imagemanager.folders
+        ) {
+            continue;
+        }
+ 
+        folders =
+            normalizeCollection(
+                endpoint.imagemanager.folders,
+                looksLikeFolder
+            );
+ 
+        seenJobs = {};
+        endpointJobCount = 0;
+        endpointIssueJobCount = 0;
+ 
+        for (
+            folderIndex = 0;
+            folderIndex < folders.length;
+            folderIndex++
+        ) {
+            folder =
+                folders[
+                    folderIndex
+                ];
+ 
+            if (!isObject(folder)) {
+                continue;
+            }
+ 
+            folderPath =
+                getFolderPath(
+                    folder
+                );
+ 
+            jobs =
+                normalizeCollection(
+                    getFirstValue(
+                        folder,
+                        [
+                            'replication_jobs',
+                            'replicationJobs',
+                            'replications'
+                        ]
+                    ),
+                    looksLikeReplicationJob
+                );
+ 
+            for (
+                jobIndex = 0;
+                jobIndex < jobs.length;
+                jobIndex++
+            ) {
+                job =
+                    jobs[
+                        jobIndex
+                    ];
+ 
+                if (!isObject(job)) {
+                    continue;
+                }
+ 
+                jobName =
+                    getReplicationJobName(
+                        job
+                    );
+ 
+                targetLocation =
+                    getTargetLocation(
+                        job
+                    );
+ 
+                /*
+                 * Remove exact duplicate copies of the same
+                 * replication job returned by the API.
+                 */
+                signature =
+                    String(endpointKey) +
+                    '|' +
+                    folderPath +
+                    '|' +
+                    jobName +
+                    '|' +
+                    targetLocation +
+                    '|' +
+                    safeText(
+                        getLastSuccess(job)
+                    ) +
+                    '|' +
+                    String(
+                        getQueuedFiles(job)
+                    );
+ 
+                if (
+                    seenJobs[
+                        signature
+                    ]
+                ) {
+                    duplicateJobCount =
+                        duplicateJobCount + 1;
+ 
+                    continue;
+                }
+ 
+                seenJobs[
+                    signature
+                ] =
+                    true;
+ 
+                evaluation =
+                    testReplicationIssue(
+                        endpoint,
+                        job,
+                        staleHours
+                    );
+ 
+                endpointJobCount =
+                    endpointJobCount + 1;
+ 
+                replicationJobCount =
+                    replicationJobCount + 1;
+ 
+                if (
+                    evaluation.isIssue
+                ) {
+                    endpointIssueJobCount =
+                        endpointIssueJobCount + 1;
+ 
+                    issueCount =
+                        issueCount + 1;
+                }
+            }
+        }
+ 
+        /*
+         * Do not publish endpoints without replication data.
+         */
+        if (
+            endpointJobCount === 0
+        ) {
+            continue;
+        }
+ 
+        dataEndpointCount =
+            dataEndpointCount + 1;
+ 
+        if (
+            endpointIssueJobCount > 0
+        ) {
+            issueEndpointCount =
+                issueEndpointCount + 1;
+        }
+ 
+        rows.push({
+            endpointKey:
+                safeText(
+                    endpointKey
+                ),
+ 
+            deviceName:
+                cleanDisplayText(
+                    endpoint.name
+                ),
+ 
+            replicationHealth:
+                endpointIssueJobCount > 0
+                    ? 'Issue'
+                    : 'Healthy'
+        });
+    }
+ 
+    rows.sort(
+        function (
+            first,
+            second
+        ) {
+            var firstKey =
+                (
+                    first.deviceName +
+                    '|' +
+                    first.endpointKey
+                ).toLowerCase();
+ 
+            var secondKey =
+                (
+                    second.deviceName +
+                    '|' +
+                    second.endpointKey
+                ).toLowerCase();
+ 
+            if (
+                firstKey < secondKey
+            ) {
+                return -1;
+            }
+ 
+            if (
+                firstKey > secondKey
+            ) {
+                return 1;
+            }
+ 
+            return 0;
+        }
+    );
+ 
+    return {
+        rows:
+            rows,
+ 
+        endpointCount:
+            endpointCount,
+ 
+        dataEndpointCount:
+            dataEndpointCount,
+ 
+        issueEndpointCount:
+            issueEndpointCount,
+ 
+        replicationJobCount:
+            replicationJobCount,
+ 
+        issueCount:
+            issueCount,
+ 
+        duplicateJobCount:
+            duplicateJobCount
+    };
+}
+ 
+/*
+ * Stable device-name table IDs
+ */
+ 
+function hashText(value) {
+    var text =
+        String(value);
+ 
+    var hash =
+        2166136261;
+ 
+    var i;
+ 
+    for (
+        i = 0;
+        i < text.length;
+        i++
+    ) {
+        hash ^=
+            text.charCodeAt(i);
+ 
+        hash +=
+            (hash << 1) +
+            (hash << 4) +
+            (hash << 7) +
+            (hash << 8) +
+            (hash << 24);
+    }
+ 
+    return (
+        '00000000' +
+        (
+            hash >>> 0
+        ).toString(16)
+    ).slice(-8);
+}
+ 
+function getBaseRowId(row) {
+    var deviceName =
+        row.deviceName;
+ 
+    if (
+        !deviceName ||
+        deviceName === 'N/A'
+    ) {
+        deviceName =
+            'Unnamed Endpoint';
+    }
+ 
+    return cleanDisplayText(
+        deviceName
+    ).substring(
+        0,
+        MAX_RECORD_ID_LENGTH
+    );
+}
+ 
+function buildBaseRowCounts(rows) {
+    var counts = {};
+    var i;
+    var baseId;
+ 
+    for (
+        i = 0;
+        i < rows.length;
+        i++
+    ) {
+        baseId =
+            getBaseRowId(
+                rows[i]
+            );
+ 
+        counts[
+            baseId
+        ] =
+            (
+                counts[
+                    baseId
+                ] ||
+                0
+            ) +
+            1;
+    }
+ 
+    return counts;
+}
+ 
+function createRowId(
+    row,
+    baseCounts,
+    usedIds
+) {
+    var baseId =
+        getBaseRowId(
+            row
+        );
+ 
+    var suffix;
+    var rowId;
+    var collisionNumber;
+    var collisionSuffix;
+ 
+    /*
+     * Normal case: ID is exactly the device name.
+     */
+    if (
+        baseCounts[
+            baseId
+        ] === 1 &&
+        !usedIds[
+            baseId
+        ]
+    ) {
+        return baseId;
+    }
+ 
+    /*
+     * Separate ShadowControl endpoints can occasionally
+     * have the same device name. Add a stable suffix only
+     * in that situation.
+     */
+    suffix =
+        ' [' +
+        hashText(
+            row.endpointKey
+        ) +
+        ']';
+ 
+    rowId =
+        baseId.substring(
+            0,
+            MAX_RECORD_ID_LENGTH -
+            suffix.length
+        ) +
+        suffix;
+ 
+    collisionNumber = 2;
+ 
+    while (
+        usedIds[
+            rowId
+        ]
+    ) {
+        collisionSuffix =
+            ' [' +
+            hashText(
+                row.endpointKey
+            ).substring(
+                0,
+                6
+            ) +
+            '-' +
+            String(
+                collisionNumber
+            ) +
+            ']';
+ 
+        rowId =
+            baseId.substring(
+                0,
+                MAX_RECORD_ID_LENGTH -
+                collisionSuffix.length
+            ) +
+            collisionSuffix;
+ 
+        collisionNumber =
+            collisionNumber + 1;
+    }
+ 
+    return rowId;
+}
+ 
+/*
+ * Simplified v1.2 table
+ */
+ 
+/**
+ * Converts the original Replication Health value into
+ * the simplified table status.
+ *
+ * Exact Healthy => Healthy
+ * Anything else => Failed
+ */
+function getSimplifiedStatus(row) {
+    if (
+        trimText(
+            row.replicationHealth
+        ) === 'Healthy'
+    ) {
+        return 'Healthy';
+    }
+ 
+    return 'Failed';
+}
+ 
+/**
+ * The Domotz table automatically displays the row ID
+ * as the ID column. Only Status must be defined here.
+ */
+function createReplicationTable() {
+    return D.createTable(
+        'ShadowControl Replication Jobs',
+        [
+            {
+                label:
+                    'Status'
+            }
+        ]
+    );
+}
+ 
+function addRowsToTable(
+    table,
+    rows
+) {
+    var baseCounts =
+        buildBaseRowCounts(
+            rows
+        );
+ 
+    var usedIds = {};
+    var i;
+    var row;
+    var rowId;
+    var status;
+ 
+    for (
+        i = 0;
+        i < rows.length;
+        i++
+    ) {
+        row =
+            rows[i];
+ 
+        rowId =
+            createRowId(
+                row,
+                baseCounts,
+                usedIds
+            );
+ 
+        usedIds[
+            rowId
+        ] =
+            true;
+ 
+        status =
+            getSimplifiedStatus(
+                row
+            );
+ 
+        table.addMetrics(
+            rowId,
+            [
+                {
+                    value:
+                        tableText(
+                            status
+                        )
+                }
+            ]
+        );
+    }
+}
+ 
+/*
+ * Summary metrics/top section
+ */
+ 
+function createStringMetric(
+    uid,
+    name,
+    value,
+    configuration
+) {
+    return D.createMetric({
+        uid:
+            uid,
+ 
+        name:
+            name,
+ 
+        value:
+            value,
+ 
+        unit:
+            '',
+ 
+        valueType:
+            D.valueType.STRING,
+ 
+        metadata: {
+            url:
+                configuration.baseUrl
+        }
+    });
+}
+ 
+function createNumberMetric(
+    uid,
+    name,
+    value,
+    unit,
+    configuration
+) {
+    return D.createMetric({
+        uid:
+            uid,
+ 
+        name:
+            name,
+ 
+        value:
+            value,
+ 
+        unit:
+            unit || '',
+ 
+        valueType:
+            D.valueType.NUMBER,
+ 
+        metadata: {
+            url:
+                configuration.baseUrl
+        }
+    });
+}
+ 
+function createSummaryMetrics(
+    results,
+    configuration
+) {
+    return [
+        createStringMetric(
+            'replication_health',
+            'Replication Health',
+            results.issueCount > 0
+                ? 'Issue'
+                : 'Healthy',
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'replication_issue_count',
+            'Replication Issue Count',
+            results.issueCount,
+            '',
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'replication_job_count',
+            'Replication Job Count',
+            results.replicationJobCount,
+            '',
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'endpoint_count',
+            'ShadowControl Endpoint Count',
+            results.endpointCount,
+            '',
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'replication_stale_hours',
+            'Replication Stale Threshold',
+            configuration.staleHours,
+            'h',
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'replication_issue_endpoint_count',
+            'Replication Issue Endpoint Count',
+            results.issueEndpointCount,
+            '',
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'replication_data_endpoint_count',
+            'Endpoints With Replication Data',
+            results.dataEndpointCount,
+            '',
+            configuration
+        )
+    ];
+}
+ 
+/**
+ * @remote_procedure
+ * @label Validate ShadowControl API
+ * @documentation Validates the appliance URL, Report API token, and current-status response.
+ */
+function validate() {
+    var configuration =
+        getConfiguration();
+ 
+    if (
+        configuration.error
+    ) {
+        failDriver(
+            configuration.error ===
+                'authentication'
+                ? 'authentication'
+                : 'generic'
+        );
+ 
+        return;
+    }
+ 
+    getShadowControlStatus(
+        configuration,
+        function (
+            errorType,
+            status
+        ) {
+            if (errorType) {
+                failDriver(
+                    errorType
+                );
+ 
+                return;
+            }
+ 
+            console.info(
+                'Validated ShadowControl API access. Endpoint records returned: ' +
+                String(
+                    getObjectKeys(
+                        status
+                    ).length
+                )
+            );
+ 
+            D.success();
+        }
+    );
+}
+ 
+/**
+ * @remote_procedure
+ * @label Get ShadowControl Replication Health
+ * @documentation Publishes replication summary metrics and a simplified ID/Status table.
+ */
+function get_status() {
+    var configuration =
+        getConfiguration();
+ 
+    if (
+        configuration.error
+    ) {
+        failDriver(
+            configuration.error ===
+                'authentication'
+                ? 'authentication'
+                : 'generic'
+        );
+ 
+        return;
+    }
+ 
+    getShadowControlStatus(
+        configuration,
+        function (
+            errorType,
+            status
+        ) {
+            var results;
+            var metrics;
+            var table;
+ 
+            if (errorType) {
+                failDriver(
+                    errorType
+                );
+ 
+                return;
+            }
+ 
+            results =
+                collectReplicationResults(
+                    status,
+                    configuration.staleHours
+                );
+ 
+            metrics =
+                createSummaryMetrics(
+                    results,
+                    configuration
+                );
+ 
+            console.info(
+                'ShadowControl endpoints reviewed: ' +
+                String(
+                    results.endpointCount
+                )
+            );
+ 
+            console.info(
+                'Endpoints with replication data: ' +
+                String(
+                    results.dataEndpointCount
+                )
+            );
+ 
+            console.info(
+                'Replication jobs reviewed: ' +
+                String(
+                    results.replicationJobCount
+                )
+            );
+ 
+            console.info(
+                'Replication issue jobs: ' +
+                String(
+                    results.issueCount
+                )
+            );
+ 
+            console.info(
+                'Replication issue endpoints: ' +
+                String(
+                    results.issueEndpointCount
+                )
+            );
+ 
+            console.info(
+                'Exact duplicate API job records skipped: ' +
+                String(
+                    results.duplicateJobCount
+                )
+            );
+ 
+            if (
+                results.rows.length === 0
+            ) {
+                D.success(
+                    metrics
+                );
+ 
+                return;
+            }
+ 
+            table =
+                createReplicationTable();
+ 
+            addRowsToTable(
+                table,
+                results.rows
+            );
+ 
+            D.success(
+                metrics,
+                table
+            );
+        }
+    );
+}
