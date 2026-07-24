@@ -1,0 +1,2513 @@
+/**
+ * Domotz Custom Integration
+ * Name: Shadow Control - Verification Monitor
+ * Version: 1.2.0
+ *
+ * Description:
+ * Retrieves current ShadowControl endpoint information and evaluates
+ * ImageManager verification status.
+ *
+ * Variables/top section retained:
+ * - Verification Health
+ * - Verification Issue Endpoint Count
+ * - Verification Warning Endpoint Count
+ * - Verification Failure Count
+ * - Verification Record Count
+ * - Endpoints With Verification Data
+ * - ShadowControl Endpoint Count
+ *
+ * Simplified bottom table:
+ * - ID: Device name
+ * - Failed Verifications: Healthy or Failed
+ *
+ * Status translation:
+ * - Failed Verification Count equals 0 => Healthy
+ * - Failed Verification Count is anything other than 0 => Failed
+ *
+ * Required parameters:
+ * - Appliance
+ * - Token
+ */
+ 
+/**
+ * @description ShadowControl appliance base URL
+ * @type TEXT
+ */
+var Appliance =
+    D.getParameter('Appliance');
+ 
+/**
+ * @description ShadowControl Report API token
+ * @type SECRET_TEXT
+ */
+var Token =
+    D.getParameter('Token');
+ 
+var HARDCODED_APPLIANCE = '';
+var STATUS_API_PATH = '/api/reports/status/';
+var REQUEST_TIMEOUT_MS = 60000;
+var MAX_TABLE_VALUE_LENGTH = 500;
+var MAX_RECORD_ID_LENGTH = 50;
+var MAX_ALERT_TEXT_LENGTH = 20000;
+ 
+/*
+ * Basic value helpers
+ */
+ 
+function isArray(value) {
+    return Array.isArray(value);
+}
+ 
+function isObject(value) {
+    return (
+        value !== null &&
+        typeof value === 'object' &&
+        !isArray(value)
+    );
+}
+ 
+function isEmpty(value) {
+    return (
+        value === null ||
+        typeof value === 'undefined' ||
+        value === ''
+    );
+}
+ 
+function trimText(value) {
+    if (isEmpty(value)) {
+        return '';
+    }
+ 
+    return String(value).replace(
+        /^\s+|\s+$/g,
+        ''
+    );
+}
+ 
+function safeText(value) {
+    if (isEmpty(value)) {
+        return 'N/A';
+    }
+ 
+    if (typeof value === 'boolean') {
+        return value
+            ? 'True'
+            : 'False';
+    }
+ 
+    if (isArray(value)) {
+        if (value.length === 0) {
+            return 'N/A';
+        }
+ 
+        return value.join(', ');
+    }
+ 
+    if (isObject(value)) {
+        try {
+            return JSON.stringify(value);
+        } catch (error) {
+            return '[Object]';
+        }
+    }
+ 
+    return String(value);
+}
+ 
+function cleanDisplayText(value) {
+    var text =
+        safeText(value);
+ 
+    if (text === 'N/A') {
+        return text;
+    }
+ 
+    text =
+        text
+            .replace(
+                /[\r\n\t]+/g,
+                ' '
+            )
+            .replace(
+                /\s+/g,
+                ' '
+            )
+            .replace(
+                /^\s+|\s+$/g,
+                ''
+            );
+ 
+    return text || 'N/A';
+}
+ 
+function tableText(value) {
+    return cleanDisplayText(
+        value
+    ).substring(
+        0,
+        MAX_TABLE_VALUE_LENGTH
+    );
+}
+ 
+function getObjectKeys(value) {
+    var keys = [];
+    var key;
+ 
+    if (!isObject(value)) {
+        return keys;
+    }
+ 
+    for (key in value) {
+        if (
+            Object.prototype.hasOwnProperty.call(
+                value,
+                key
+            )
+        ) {
+            keys.push(key);
+        }
+    }
+ 
+    return keys;
+}
+ 
+function getFirstValue(
+    source,
+    propertyNames
+) {
+    var i;
+    var value;
+ 
+    if (!isObject(source)) {
+        return null;
+    }
+ 
+    for (
+        i = 0;
+        i < propertyNames.length;
+        i++
+    ) {
+        value =
+            source[
+                propertyNames[i]
+            ];
+ 
+        if (!isEmpty(value)) {
+            return value;
+        }
+    }
+ 
+    return null;
+}
+ 
+function getValueCount(value) {
+    if (
+        value === null ||
+        typeof value === 'undefined' ||
+        value === '' ||
+        value === false ||
+        value === 0
+    ) {
+        return 0;
+    }
+ 
+    if (isArray(value)) {
+        return value.length;
+    }
+ 
+    if (isObject(value)) {
+        return getObjectKeys(
+            value
+        ).length;
+    }
+ 
+    return 1;
+}
+ 
+/*
+ * Collection normalization
+ */
+ 
+function looksLikeFolder(value) {
+    if (!isObject(value)) {
+        return false;
+    }
+ 
+    return (
+        typeof value.path !== 'undefined' ||
+        typeof value.folder_path !== 'undefined' ||
+        typeof value.folderPath !== 'undefined' ||
+        typeof value.verification_jobs !== 'undefined' ||
+        typeof value.verificationJobs !== 'undefined' ||
+        typeof value.verification !== 'undefined'
+    );
+}
+ 
+function looksLikeVerificationRecord(value) {
+    if (!isObject(value)) {
+        return false;
+    }
+ 
+    return (
+        typeof value.status !== 'undefined' ||
+        typeof value.state !== 'undefined' ||
+        typeof value.health !== 'undefined' ||
+        typeof value.result !== 'undefined' ||
+        typeof value.last_result !== 'undefined' ||
+        typeof value.lastResult !== 'undefined' ||
+        typeof value.errors !== 'undefined' ||
+        typeof value.error !== 'undefined' ||
+        typeof value.warnings !== 'undefined' ||
+        typeof value.warning !== 'undefined' ||
+        typeof value.last_run !== 'undefined' ||
+        typeof value.lastRun !== 'undefined' ||
+        typeof value.last_success_time !== 'undefined' ||
+        typeof value.lastSuccessTime !== 'undefined' ||
+        typeof value.completed_time !== 'undefined' ||
+        typeof value.completedTime !== 'undefined' ||
+        typeof value.message !== 'undefined' ||
+        typeof value.description !== 'undefined'
+    );
+}
+ 
+function normalizeCollection(
+    value,
+    detector
+) {
+    var results = [];
+    var keys;
+    var i;
+    var child;
+ 
+    if (
+        value === null ||
+        typeof value === 'undefined'
+    ) {
+        return results;
+    }
+ 
+    if (isArray(value)) {
+        return value;
+    }
+ 
+    if (!isObject(value)) {
+        return [value];
+    }
+ 
+    if (
+        detector &&
+        detector(value)
+    ) {
+        return [value];
+    }
+ 
+    keys =
+        getObjectKeys(value);
+ 
+    for (
+        i = 0;
+        i < keys.length;
+        i++
+    ) {
+        child =
+            value[
+                keys[i]
+            ];
+ 
+        if (
+            child !== null &&
+            typeof child !== 'undefined'
+        ) {
+            results.push(child);
+        }
+    }
+ 
+    return results;
+}
+ 
+/*
+ * Text and status matching
+ */
+ 
+function normalizeSearchText(value) {
+    return String(value)
+        .toLowerCase()
+        .replace(
+            /[_-]+/g,
+            ' '
+        )
+        .replace(
+            /[^a-z0-9]+/g,
+            ' '
+        )
+        .replace(
+            /\s+/g,
+            ' '
+        )
+        .replace(
+            /^\s+|\s+$/g,
+            ''
+        );
+}
+ 
+function containsAnyPhrase(
+    value,
+    phrases
+) {
+    var text =
+        normalizeSearchText(value);
+ 
+    var i;
+    var phrase;
+ 
+    for (
+        i = 0;
+        i < phrases.length;
+        i++
+    ) {
+        phrase =
+            normalizeSearchText(
+                phrases[i]
+            );
+ 
+        if (
+            phrase &&
+            text.indexOf(
+                phrase
+            ) !== -1
+        ) {
+            return true;
+        }
+    }
+ 
+    return false;
+}
+ 
+function isFailureStatus(value) {
+    var text =
+        normalizeSearchText(value);
+ 
+    if (!text) {
+        return false;
+    }
+ 
+    return (
+        text.indexOf('fail') !== -1 ||
+        text.indexOf('failure') !== -1 ||
+        text.indexOf('error') !== -1 ||
+        text.indexOf('critical') !== -1 ||
+        text.indexOf('broken') !== -1 ||
+        text.indexOf('corrupt') !== -1 ||
+        text.indexOf('invalid') !== -1 ||
+        text.indexOf('unable') !== -1 ||
+        text.indexOf('unsuccessful') !== -1 ||
+        text === 'red'
+    );
+}
+ 
+function isWarningStatus(value) {
+    var text =
+        normalizeSearchText(value);
+ 
+    if (!text) {
+        return false;
+    }
+ 
+    return (
+        text.indexOf('warning') !== -1 ||
+        text.indexOf('attention') !== -1 ||
+        text.indexOf('partial') !== -1 ||
+        text === 'yellow'
+    );
+}
+ 
+function hasVerificationFailureText(value) {
+    return containsAnyPhrase(
+        value,
+        [
+            'Verification Failed',
+            'Verification Failure',
+            'Verification Job Failed',
+            'Verify Failed',
+            'Image Verification Failed',
+            'Basic Verification Failed',
+            'Advanced Verification Failed',
+            'Verification Error',
+            'Image Corrupt',
+            'Corrupt Image'
+        ]
+    );
+}
+ 
+/**
+ * Retrieves only known notification containers.
+ */
+function getNotificationText(source) {
+    var propertyNames = [
+        'notifications',
+        'notification',
+        'alerts',
+        'alert',
+        'events',
+        'event',
+        'errors',
+        'error',
+        'warnings',
+        'warning',
+        'messages',
+        'message',
+        'problems',
+        'problem',
+        'failures',
+        'failure'
+    ];
+ 
+    var parts = [];
+    var i;
+    var value;
+    var serialized;
+    var result;
+ 
+    if (!isObject(source)) {
+        return '';
+    }
+ 
+    for (
+        i = 0;
+        i < propertyNames.length;
+        i++
+    ) {
+        value =
+            source[
+                propertyNames[i]
+            ];
+ 
+        if (
+            value === null ||
+            typeof value === 'undefined'
+        ) {
+            continue;
+        }
+ 
+        try {
+            serialized =
+                JSON.stringify(value);
+        } catch (error) {
+            serialized =
+                safeText(value);
+        }
+ 
+        parts.push(serialized);
+    }
+ 
+    result =
+        parts.join(' ');
+ 
+    if (
+        result.length >
+        MAX_ALERT_TEXT_LENGTH
+    ) {
+        result =
+            result.substring(
+                0,
+                MAX_ALERT_TEXT_LENGTH
+            );
+    }
+ 
+    return result;
+}
+ 
+/*
+ * Appliance configuration
+ */
+ 
+function getApplianceValue() {
+    var hardcoded =
+        trimText(
+            HARDCODED_APPLIANCE
+        );
+ 
+    if (hardcoded) {
+        return hardcoded;
+    }
+ 
+    return trimText(
+        Appliance
+    );
+}
+ 
+function parseAppliance(value) {
+    var applianceText;
+    var match;
+    var protocol;
+    var host;
+    var port;
+    var basePath;
+    var requestPath;
+    var urlHost;
+    var includePort;
+    var baseUrl;
+ 
+    applianceText =
+        trimText(value);
+ 
+    if (!applianceText) {
+        return null;
+    }
+ 
+    if (
+        !/^[a-z][a-z0-9+.-]*:\/\//i.test(
+            applianceText
+        )
+    ) {
+        applianceText =
+            'https://' +
+            applianceText;
+    }
+ 
+    match =
+        applianceText.match(
+            /^(https?):\/\/(\[[^\]]+\]|[^\/:?#]+)(?::([0-9]+))?([^?#]*)?(?:\?[^#]*)?(?:#.*)?$/i
+        );
+ 
+    if (!match) {
+        return null;
+    }
+ 
+    protocol =
+        String(
+            match[1]
+        ).toLowerCase();
+ 
+    host =
+        String(
+            match[2]
+        );
+ 
+    if (
+        host.charAt(0) === '[' &&
+        host.charAt(
+            host.length - 1
+        ) === ']'
+    ) {
+        host =
+            host.substring(
+                1,
+                host.length - 1
+            );
+    }
+ 
+    if (match[3]) {
+        port =
+            parseInt(
+                match[3],
+                10
+            );
+    } else {
+        port =
+            protocol === 'https'
+                ? 443
+                : 80;
+    }
+ 
+    if (
+        isNaN(port) ||
+        port < 1 ||
+        port > 65535
+    ) {
+        return null;
+    }
+ 
+    basePath =
+        match[4] || '';
+ 
+    basePath =
+        basePath.replace(
+            /\/+$/g,
+            ''
+        );
+ 
+    if (
+        /\/api\/reports\/status$/i.test(
+            basePath
+        )
+    ) {
+        basePath =
+            basePath.replace(
+                /\/api\/reports\/status$/i,
+                ''
+            );
+    }
+ 
+    requestPath =
+        basePath +
+        STATUS_API_PATH;
+ 
+    urlHost =
+        host.indexOf(':') !== -1
+            ? '[' + host + ']'
+            : host;
+ 
+    includePort =
+        !(
+            protocol === 'https' &&
+            port === 443
+        ) &&
+        !(
+            protocol === 'http' &&
+            port === 80
+        );
+ 
+    baseUrl =
+        protocol +
+        '://' +
+        urlHost +
+        (
+            includePort
+                ? ':' + String(port)
+                : ''
+        ) +
+        basePath;
+ 
+    return {
+        protocol:
+            protocol,
+ 
+        host:
+            host,
+ 
+        port:
+            port,
+ 
+        requestPath:
+            requestPath,
+ 
+        baseUrl:
+            baseUrl
+    };
+}
+ 
+function getConfiguration() {
+    var applianceValue =
+        getApplianceValue();
+ 
+    var configuration;
+ 
+    if (!applianceValue) {
+        console.error(
+            'Missing Appliance parameter'
+        );
+ 
+        return {
+            error:
+                'configuration'
+        };
+    }
+ 
+    if (
+        !trimText(Token)
+    ) {
+        console.error(
+            'Missing Token parameter'
+        );
+ 
+        return {
+            error:
+                'authentication'
+        };
+    }
+ 
+    configuration =
+        parseAppliance(
+            applianceValue
+        );
+ 
+    if (!configuration) {
+        console.error(
+            'The Appliance parameter is not a valid URL or hostname'
+        );
+ 
+        return {
+            error:
+                'configuration'
+        };
+    }
+ 
+    configuration.token =
+        Token;
+ 
+    return configuration;
+}
+ 
+/*
+ * HTTP and failure handling
+ */
+ 
+function isTimeoutError(error) {
+    var errorText;
+ 
+    if (!error) {
+        return false;
+    }
+ 
+    errorText =
+        String(
+            error.message ||
+            error
+        ).toLowerCase();
+ 
+    return (
+        errorText.indexOf('timeout') !== -1 ||
+        errorText.indexOf('timed out') !== -1 ||
+        errorText.indexOf('etimedout') !== -1
+    );
+}
+ 
+function failDriver(errorType) {
+    if (
+        errorType ===
+        'authentication'
+    ) {
+        D.failure(
+            D.errorType.AUTHENTICATION_ERROR
+        );
+ 
+        return;
+    }
+ 
+    if (
+        errorType ===
+        'parsing'
+    ) {
+        D.failure(
+            D.errorType.PARSING_ERROR
+        );
+ 
+        return;
+    }
+ 
+    if (
+        errorType ===
+        'timeout'
+    ) {
+        D.failure(
+            D.errorType.TIMEOUT_ERROR
+        );
+ 
+        return;
+    }
+ 
+    if (
+        errorType ===
+        'resource'
+    ) {
+        D.failure(
+            D.errorType.RESOURCE_UNAVAILABLE
+        );
+ 
+        return;
+    }
+ 
+    D.failure(
+        D.errorType.GENERIC_ERROR
+    );
+}
+ 
+function getShadowControlStatus(
+    configuration,
+    callback
+) {
+    var shadowControl;
+    var options;
+    var requestStart;
+ 
+    shadowControl =
+        D.createExternalDevice(
+            configuration.host
+        );
+ 
+    options = {
+        url:
+            configuration.requestPath,
+ 
+        protocol:
+            configuration.protocol,
+ 
+        port:
+            configuration.port,
+ 
+        rejectUnauthorized:
+            false,
+ 
+        timeout:
+            REQUEST_TIMEOUT_MS,
+ 
+        headers: {
+            'Accept':
+                'application/json',
+ 
+            'CMD_TOKEN':
+                configuration.token
+        }
+    };
+ 
+    requestStart =
+        new Date().getTime();
+ 
+    console.info(
+        'Requesting ShadowControl verification data from ' +
+        configuration.baseUrl +
+        STATUS_API_PATH
+    );
+ 
+    shadowControl.http.get(
+        options,
+        function (
+            error,
+            response,
+            body
+        ) {
+            var statusCode;
+            var parsedBody;
+            var elapsed;
+ 
+            elapsed =
+                new Date().getTime() -
+                requestStart;
+ 
+            console.info(
+                'ShadowControl API request completed in ' +
+                String(elapsed) +
+                ' ms'
+            );
+ 
+            if (error) {
+                console.error(
+                    'ShadowControl HTTP error: ' +
+                    String(
+                        error.message ||
+                        error
+                    )
+                );
+ 
+                callback(
+                    isTimeoutError(error)
+                        ? 'timeout'
+                        : 'resource',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (!response) {
+                console.error(
+                    'ShadowControl returned no HTTP response'
+                );
+ 
+                callback(
+                    'resource',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            statusCode =
+                Number(
+                    response.statusCode
+                );
+ 
+            if (
+                statusCode === 401 ||
+                statusCode === 403
+            ) {
+                console.error(
+                    'ShadowControl authentication failed: HTTP ' +
+                    String(statusCode)
+                );
+ 
+                callback(
+                    'authentication',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (statusCode === 408) {
+                callback(
+                    'timeout',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (
+                statusCode === 404 ||
+                statusCode >= 500
+            ) {
+                console.error(
+                    'ShadowControl service unavailable: HTTP ' +
+                    String(statusCode)
+                );
+ 
+                callback(
+                    'resource',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (
+                isNaN(statusCode) ||
+                statusCode < 200 ||
+                statusCode >= 300
+            ) {
+                console.error(
+                    'ShadowControl returned HTTP ' +
+                    String(statusCode)
+                );
+ 
+                callback(
+                    'generic',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            try {
+                if (
+                    typeof body === 'string'
+                ) {
+                    if (
+                        trimText(body) === ''
+                    ) {
+                        console.error(
+                            'ShadowControl returned an empty response body'
+                        );
+ 
+                        callback(
+                            'parsing',
+                            null
+                        );
+ 
+                        return;
+                    }
+ 
+                    parsedBody =
+                        JSON.parse(body);
+                } else if (
+                    isObject(body)
+                ) {
+                    parsedBody =
+                        body;
+                } else {
+                    callback(
+                        'parsing',
+                        null
+                    );
+ 
+                    return;
+                }
+            } catch (parseError) {
+                console.error(
+                    'Unable to parse ShadowControl JSON: ' +
+                    String(
+                        parseError.message ||
+                        parseError
+                    )
+                );
+ 
+                callback(
+                    'parsing',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            if (
+                !isObject(parsedBody) ||
+                getObjectKeys(
+                    parsedBody
+                ).length === 0
+            ) {
+                console.error(
+                    'ShadowControl returned no endpoint data'
+                );
+ 
+                callback(
+                    'parsing',
+                    null
+                );
+ 
+                return;
+            }
+ 
+            callback(
+                null,
+                parsedBody
+            );
+        }
+    );
+}
+ 
+/*
+ * Verification record discovery
+ */
+ 
+function getVerificationRecordSignature(
+    record,
+    sourceLabel
+) {
+    return normalizeSearchText(
+        safeText(
+            getFirstValue(
+                record,
+                [
+                    'name',
+                    'job_name',
+                    'jobName',
+                    'title',
+                    'type'
+                ]
+            )
+        ) +
+        '|' +
+        safeText(
+            getFirstValue(
+                record,
+                [
+                    'status',
+                    'state',
+                    'health'
+                ]
+            )
+        ) +
+        '|' +
+        safeText(
+            getFirstValue(
+                record,
+                [
+                    'last_result',
+                    'lastResult',
+                    'result',
+                    'verification_result',
+                    'verificationResult'
+                ]
+            )
+        ) +
+        '|' +
+        safeText(
+            getFirstValue(
+                record,
+                [
+                    'last_verification_time',
+                    'lastVerificationTime',
+                    'last_verified_time',
+                    'lastVerifiedTime',
+                    'last_run',
+                    'lastRun',
+                    'completed_time',
+                    'completedTime',
+                    'last_success_time',
+                    'lastSuccessTime'
+                ]
+            )
+        ) +
+        '|' +
+        sourceLabel
+    );
+}
+ 
+function addVerificationRecord(
+    records,
+    seenRecords,
+    value,
+    sourceLabel
+) {
+    var record;
+    var signature;
+ 
+    if (
+        value === null ||
+        typeof value === 'undefined'
+    ) {
+        return;
+    }
+ 
+    if (isObject(value)) {
+        record =
+            value;
+    } else {
+        record = {
+            name:
+                sourceLabel,
+ 
+            status:
+                value
+        };
+    }
+ 
+    if (
+        !looksLikeVerificationRecord(
+            record
+        )
+    ) {
+        return;
+    }
+ 
+    signature =
+        getVerificationRecordSignature(
+            record,
+            sourceLabel
+        );
+ 
+    if (
+        seenRecords[
+            signature
+        ]
+    ) {
+        return;
+    }
+ 
+    seenRecords[
+        signature
+    ] =
+        true;
+ 
+    records.push({
+        source:
+            sourceLabel,
+ 
+        data:
+            record
+    });
+}
+ 
+function addVerificationCollection(
+    records,
+    seenRecords,
+    value,
+    sourceLabel
+) {
+    var values =
+        normalizeCollection(
+            value,
+            looksLikeVerificationRecord
+        );
+ 
+    var i;
+ 
+    for (
+        i = 0;
+        i < values.length;
+        i++
+    ) {
+        addVerificationRecord(
+            records,
+            seenRecords,
+            values[i],
+            sourceLabel
+        );
+    }
+}
+ 
+function addDirectVerificationStatus(
+    records,
+    seenRecords,
+    source,
+    sourceLabel
+) {
+    var status;
+    var result;
+    var time;
+    var message;
+ 
+    if (!isObject(source)) {
+        return;
+    }
+ 
+    status =
+        getFirstValue(
+            source,
+            [
+                'verification_status',
+                'verificationStatus',
+                'verify_status',
+                'verifyStatus'
+            ]
+        );
+ 
+    result =
+        getFirstValue(
+            source,
+            [
+                'verification_result',
+                'verificationResult',
+                'last_verification_result',
+                'lastVerificationResult',
+                'verify_result',
+                'verifyResult'
+            ]
+        );
+ 
+    time =
+        getFirstValue(
+            source,
+            [
+                'last_verification_time',
+                'lastVerificationTime',
+                'last_verified_time',
+                'lastVerifiedTime',
+                'verification_time',
+                'verificationTime'
+            ]
+        );
+ 
+    message =
+        getFirstValue(
+            source,
+            [
+                'verification_message',
+                'verificationMessage',
+                'verification_error',
+                'verificationError'
+            ]
+        );
+ 
+    if (
+        isEmpty(status) &&
+        isEmpty(result) &&
+        isEmpty(time) &&
+        isEmpty(message)
+    ) {
+        return;
+    }
+ 
+    addVerificationRecord(
+        records,
+        seenRecords,
+        {
+            name:
+                'Verification Status',
+ 
+            status:
+                status,
+ 
+            result:
+                result,
+ 
+            last_verification_time:
+                time,
+ 
+            message:
+                message
+        },
+        sourceLabel +
+        ':direct'
+    );
+}
+ 
+function addGenericVerificationJobs(
+    records,
+    seenRecords,
+    source,
+    sourceLabel
+) {
+    var containerNames = [
+        'jobs',
+        'tasks',
+        'activities'
+    ];
+ 
+    var i;
+    var values;
+    var valueIndex;
+    var value;
+    var identifyingText;
+ 
+    if (!isObject(source)) {
+        return;
+    }
+ 
+    for (
+        i = 0;
+        i < containerNames.length;
+        i++
+    ) {
+        values =
+            normalizeCollection(
+                source[
+                    containerNames[i]
+                ],
+                null
+            );
+ 
+        for (
+            valueIndex = 0;
+            valueIndex < values.length;
+            valueIndex++
+        ) {
+            value =
+                values[
+                    valueIndex
+                ];
+ 
+            if (!isObject(value)) {
+                continue;
+            }
+ 
+            identifyingText =
+                safeText(
+                    getFirstValue(
+                        value,
+                        [
+                            'name',
+                            'title',
+                            'type',
+                            'category',
+                            'service',
+                            'task_type',
+                            'taskType'
+                        ]
+                    )
+                );
+ 
+            if (
+                !containsAnyPhrase(
+                    identifyingText,
+                    [
+                        'verification',
+                        'verify',
+                        'image verification',
+                        'advanced verification',
+                        'basic verification'
+                    ]
+                )
+            ) {
+                continue;
+            }
+ 
+            addVerificationRecord(
+                records,
+                seenRecords,
+                value,
+                sourceLabel +
+                ':' +
+                containerNames[i]
+            );
+        }
+    }
+}
+ 
+function collectVerificationFromSource(
+    records,
+    seenRecords,
+    source,
+    sourceLabel
+) {
+    var collectionNames = [
+        'verification_jobs',
+        'verificationJobs',
+        'verification',
+        'verifications',
+        'verify_jobs',
+        'verifyJobs',
+        'verification_tasks',
+        'verificationTasks'
+    ];
+ 
+    var i;
+ 
+    if (!isObject(source)) {
+        return;
+    }
+ 
+    for (
+        i = 0;
+        i < collectionNames.length;
+        i++
+    ) {
+        if (
+            typeof source[
+                collectionNames[i]
+            ] === 'undefined'
+        ) {
+            continue;
+        }
+ 
+        addVerificationCollection(
+            records,
+            seenRecords,
+            source[
+                collectionNames[i]
+            ],
+            sourceLabel +
+            ':' +
+            collectionNames[i]
+        );
+    }
+ 
+    addDirectVerificationStatus(
+        records,
+        seenRecords,
+        source,
+        sourceLabel
+    );
+ 
+    addGenericVerificationJobs(
+        records,
+        seenRecords,
+        source,
+        sourceLabel
+    );
+}
+ 
+/*
+ * Verification evaluation
+ */
+ 
+function evaluateVerificationRecord(wrapper) {
+    var record =
+        wrapper.data;
+ 
+    var name;
+    var status;
+    var result;
+    var message;
+    var errorCount;
+    var warningCount;
+    var recordText;
+    var failure;
+    var warning;
+ 
+    name =
+        getFirstValue(
+            record,
+            [
+                'name',
+                'job_name',
+                'jobName',
+                'title',
+                'type'
+            ]
+        ) ||
+        'Verification';
+ 
+    status =
+        getFirstValue(
+            record,
+            [
+                'status',
+                'state',
+                'health'
+            ]
+        );
+ 
+    result =
+        getFirstValue(
+            record,
+            [
+                'last_result',
+                'lastResult',
+                'result',
+                'verification_result',
+                'verificationResult'
+            ]
+        );
+ 
+    message =
+        getFirstValue(
+            record,
+            [
+                'message',
+                'description',
+                'reason',
+                'summary',
+                'text'
+            ]
+        );
+ 
+    errorCount =
+        getValueCount(
+            getFirstValue(
+                record,
+                [
+                    'errors',
+                    'error'
+                ]
+            )
+        );
+ 
+    warningCount =
+        getValueCount(
+            getFirstValue(
+                record,
+                [
+                    'warnings',
+                    'warning'
+                ]
+            )
+        );
+ 
+    recordText =
+        safeText(name) +
+        ' ' +
+        safeText(status) +
+        ' ' +
+        safeText(result) +
+        ' ' +
+        safeText(message) +
+        ' ' +
+        getNotificationText(record);
+ 
+    failure =
+        errorCount > 0 ||
+        isFailureStatus(status) ||
+        isFailureStatus(result) ||
+        hasVerificationFailureText(
+            recordText
+        );
+ 
+    warning =
+        !failure &&
+        (
+            warningCount > 0 ||
+            isWarningStatus(status) ||
+            isWarningStatus(result)
+        );
+ 
+    return {
+        failure:
+            failure,
+ 
+        warning:
+            warning,
+ 
+        errorCount:
+            errorCount,
+ 
+        warningCount:
+            warningCount
+    };
+}
+ 
+/*
+ * Analyze one endpoint
+ */
+ 
+function analyzeEndpoint(
+    endpointKey,
+    endpoint
+) {
+    var imageManager =
+        endpoint.imagemanager;
+ 
+    var folders = [];
+    var records = [];
+    var seenRecords = {};
+    var alertParts = [];
+ 
+    var failedCount = 0;
+    var errorCount = 0;
+    var warningCount = 0;
+ 
+    var folderIndex;
+    var recordIndex;
+    var folder;
+    var evaluation;
+    var alertText;
+    var health;
+ 
+    if (
+        imageManager &&
+        imageManager.folders
+    ) {
+        folders =
+            normalizeCollection(
+                imageManager.folders,
+                looksLikeFolder
+            );
+    }
+ 
+    alertParts.push(
+        getNotificationText(
+            endpoint
+        )
+    );
+ 
+    if (imageManager) {
+        collectVerificationFromSource(
+            records,
+            seenRecords,
+            imageManager,
+            'ImageManager'
+        );
+ 
+        alertParts.push(
+            getNotificationText(
+                imageManager
+            )
+        );
+    }
+ 
+    for (
+        folderIndex = 0;
+        folderIndex < folders.length;
+        folderIndex++
+    ) {
+        folder =
+            folders[
+                folderIndex
+            ];
+ 
+        if (!isObject(folder)) {
+            continue;
+        }
+ 
+        collectVerificationFromSource(
+            records,
+            seenRecords,
+            folder,
+            'Folder:' +
+            cleanDisplayText(
+                getFirstValue(
+                    folder,
+                    [
+                        'path',
+                        'folder_path',
+                        'folderPath',
+                        'name'
+                    ]
+                )
+            )
+        );
+ 
+        alertParts.push(
+            getNotificationText(
+                folder
+            )
+        );
+    }
+ 
+    for (
+        recordIndex = 0;
+        recordIndex < records.length;
+        recordIndex++
+    ) {
+        evaluation =
+            evaluateVerificationRecord(
+                records[
+                    recordIndex
+                ]
+            );
+ 
+        if (
+            evaluation.failure
+        ) {
+            failedCount =
+                failedCount + 1;
+        }
+ 
+        errorCount =
+            errorCount +
+            evaluation.errorCount;
+ 
+        warningCount =
+            warningCount +
+            evaluation.warningCount;
+ 
+        if (
+            evaluation.warning &&
+            evaluation.warningCount === 0
+        ) {
+            warningCount =
+                warningCount + 1;
+        }
+    }
+ 
+    alertText =
+        alertParts.join(' ');
+ 
+    if (
+        hasVerificationFailureText(
+            alertText
+        ) &&
+        failedCount === 0
+    ) {
+        failedCount =
+            1;
+    }
+ 
+    if (
+        failedCount > 0 ||
+        errorCount > 0
+    ) {
+        health =
+            'Issue';
+    } else if (
+        warningCount > 0
+    ) {
+        health =
+            'Warning';
+    } else if (
+        records.length > 0
+    ) {
+        health =
+            'Healthy';
+    } else if (!imageManager) {
+        health =
+            'Not Installed';
+    } else {
+        health =
+            'No Data';
+    }
+ 
+    return {
+        endpointKey:
+            safeText(
+                endpointKey
+            ),
+ 
+        deviceName:
+            cleanDisplayText(
+                endpoint.name
+            ),
+ 
+        verificationRecordCount:
+            records.length,
+ 
+        verificationHealth:
+            health,
+ 
+        failedVerificationCount:
+            failedCount,
+ 
+        errorCount:
+            errorCount,
+ 
+        warningCount:
+            warningCount
+    };
+}
+ 
+/*
+ * Collect endpoint results
+ */
+ 
+function collectVerificationResults(status) {
+    var endpointKeys =
+        getObjectKeys(status);
+ 
+    var rows = [];
+ 
+    var endpointCount = 0;
+    var dataEndpointCount = 0;
+    var issueEndpointCount = 0;
+    var warningEndpointCount = 0;
+    var failureCount = 0;
+    var recordCount = 0;
+ 
+    var endpointIndex;
+    var endpointKey;
+    var endpoint;
+    var row;
+ 
+    for (
+        endpointIndex = 0;
+        endpointIndex < endpointKeys.length;
+        endpointIndex++
+    ) {
+        endpointKey =
+            endpointKeys[
+                endpointIndex
+            ];
+ 
+        endpoint =
+            status[
+                endpointKey
+            ];
+ 
+        if (!isObject(endpoint)) {
+            continue;
+        }
+ 
+        endpointCount =
+            endpointCount + 1;
+ 
+        row =
+            analyzeEndpoint(
+                endpointKey,
+                endpoint
+            );
+ 
+        rows.push(row);
+ 
+        recordCount =
+            recordCount +
+            row.verificationRecordCount;
+ 
+        failureCount =
+            failureCount +
+            row.failedVerificationCount;
+ 
+        if (
+            row.verificationRecordCount > 0
+        ) {
+            dataEndpointCount =
+                dataEndpointCount + 1;
+        }
+ 
+        if (
+            row.verificationHealth ===
+            'Issue'
+        ) {
+            issueEndpointCount =
+                issueEndpointCount + 1;
+        }
+ 
+        if (
+            row.verificationHealth ===
+            'Warning'
+        ) {
+            warningEndpointCount =
+                warningEndpointCount + 1;
+        }
+    }
+ 
+    rows.sort(
+        function (
+            first,
+            second
+        ) {
+            var firstKey =
+                (
+                    first.deviceName +
+                    '|' +
+                    first.endpointKey
+                ).toLowerCase();
+ 
+            var secondKey =
+                (
+                    second.deviceName +
+                    '|' +
+                    second.endpointKey
+                ).toLowerCase();
+ 
+            if (
+                firstKey < secondKey
+            ) {
+                return -1;
+            }
+ 
+            if (
+                firstKey > secondKey
+            ) {
+                return 1;
+            }
+ 
+            return 0;
+        }
+    );
+ 
+    return {
+        rows:
+            rows,
+ 
+        endpointCount:
+            endpointCount,
+ 
+        dataEndpointCount:
+            dataEndpointCount,
+ 
+        issueEndpointCount:
+            issueEndpointCount,
+ 
+        warningEndpointCount:
+            warningEndpointCount,
+ 
+        failureCount:
+            failureCount,
+ 
+        recordCount:
+            recordCount
+    };
+}
+ 
+/*
+ * Stable device-name table IDs
+ */
+ 
+function hashText(value) {
+    var text =
+        String(value);
+ 
+    var hash =
+        2166136261;
+ 
+    var i;
+ 
+    for (
+        i = 0;
+        i < text.length;
+        i++
+    ) {
+        hash ^=
+            text.charCodeAt(i);
+ 
+        hash +=
+            (hash << 1) +
+            (hash << 4) +
+            (hash << 7) +
+            (hash << 8) +
+            (hash << 24);
+    }
+ 
+    return (
+        '00000000' +
+        (
+            hash >>> 0
+        ).toString(16)
+    ).slice(-8);
+}
+ 
+function getBaseRowId(row) {
+    var deviceName =
+        row.deviceName;
+ 
+    if (
+        !deviceName ||
+        deviceName === 'N/A'
+    ) {
+        deviceName =
+            'Unnamed Endpoint';
+    }
+ 
+    return cleanDisplayText(
+        deviceName
+    ).substring(
+        0,
+        MAX_RECORD_ID_LENGTH
+    );
+}
+ 
+function buildBaseRowCounts(rows) {
+    var counts = {};
+    var i;
+    var baseId;
+ 
+    for (
+        i = 0;
+        i < rows.length;
+        i++
+    ) {
+        baseId =
+            getBaseRowId(
+                rows[i]
+            );
+ 
+        counts[
+            baseId
+        ] =
+            (
+                counts[
+                    baseId
+                ] ||
+                0
+            ) +
+            1;
+    }
+ 
+    return counts;
+}
+ 
+function createRowId(
+    row,
+    baseCounts,
+    usedIds
+) {
+    var baseId =
+        getBaseRowId(row);
+ 
+    var suffix;
+    var rowId;
+    var collisionNumber;
+    var collisionSuffix;
+ 
+    if (
+        baseCounts[
+            baseId
+        ] === 1 &&
+        !usedIds[
+            baseId
+        ]
+    ) {
+        return baseId;
+    }
+ 
+    suffix =
+        ' [' +
+        hashText(
+            row.endpointKey
+        ) +
+        ']';
+ 
+    rowId =
+        baseId.substring(
+            0,
+            MAX_RECORD_ID_LENGTH -
+            suffix.length
+        ) +
+        suffix;
+ 
+    collisionNumber =
+        2;
+ 
+    while (
+        usedIds[
+            rowId
+        ]
+    ) {
+        collisionSuffix =
+            ' [' +
+            hashText(
+                row.endpointKey
+            ).substring(
+                0,
+                6
+            ) +
+            '-' +
+            String(
+                collisionNumber
+            ) +
+            ']';
+ 
+        rowId =
+            baseId.substring(
+                0,
+                MAX_RECORD_ID_LENGTH -
+                collisionSuffix.length
+            ) +
+            collisionSuffix;
+ 
+        collisionNumber =
+            collisionNumber + 1;
+    }
+ 
+    return rowId;
+}
+ 
+/*
+ * Simplified v1.2 table
+ */
+ 
+/**
+ * Failed Verification Count equals 0 => Healthy.
+ * Anything other than 0 => Failed.
+ */
+function getSimplifiedStatus(row) {
+    var rawValue =
+        trimText(
+            row.failedVerificationCount
+        );
+ 
+    var failedCount =
+        Number(
+            rawValue
+        );
+ 
+    if (
+        rawValue !== '' &&
+        !isNaN(failedCount) &&
+        failedCount === 0
+    ) {
+        return 'Healthy';
+    }
+ 
+    return 'Failed';
+}
+ 
+/**
+ * Domotz displays the table record ID automatically.
+ * Only the Failed Verifications column is declared.
+ */
+function createVerificationTable() {
+    return D.createTable(
+        'ShadowControl Verification Jobs',
+        [
+            {
+                label:
+                    'Failed Verifications'
+            }
+        ]
+    );
+}
+ 
+function addRowsToTable(
+    table,
+    rows
+) {
+    var baseCounts =
+        buildBaseRowCounts(
+            rows
+        );
+ 
+    var usedIds = {};
+    var i;
+    var row;
+    var rowId;
+    var status;
+ 
+    for (
+        i = 0;
+        i < rows.length;
+        i++
+    ) {
+        row =
+            rows[i];
+ 
+        rowId =
+            createRowId(
+                row,
+                baseCounts,
+                usedIds
+            );
+ 
+        usedIds[
+            rowId
+        ] =
+            true;
+ 
+        status =
+            getSimplifiedStatus(
+                row
+            );
+ 
+        table.addMetrics(
+            rowId,
+            [
+                {
+                    value:
+                        tableText(
+                            status
+                        )
+                }
+            ]
+        );
+    }
+}
+ 
+/*
+ * Summary metrics/top section
+ */
+ 
+function createStringMetric(
+    uid,
+    name,
+    value,
+    configuration
+) {
+    return D.createMetric({
+        uid:
+            uid,
+ 
+        name:
+            name,
+ 
+        value:
+            value,
+ 
+        unit:
+            '',
+ 
+        valueType:
+            D.valueType.STRING,
+ 
+        metadata: {
+            url:
+                configuration.baseUrl
+        }
+    });
+}
+ 
+function createNumberMetric(
+    uid,
+    name,
+    value,
+    configuration
+) {
+    return D.createMetric({
+        uid:
+            uid,
+ 
+        name:
+            name,
+ 
+        value:
+            value,
+ 
+        unit:
+            '',
+ 
+        valueType:
+            D.valueType.NUMBER,
+ 
+        metadata: {
+            url:
+                configuration.baseUrl
+        }
+    });
+}
+ 
+function createSummaryMetrics(
+    results,
+    configuration
+) {
+    var overallHealth;
+ 
+    if (
+        results.issueEndpointCount > 0
+    ) {
+        overallHealth =
+            'Issue';
+    } else if (
+        results.warningEndpointCount > 0
+    ) {
+        overallHealth =
+            'Warning';
+    } else if (
+        results.dataEndpointCount > 0
+    ) {
+        overallHealth =
+            'Healthy';
+    } else {
+        overallHealth =
+            'No Data';
+    }
+ 
+    return [
+        createStringMetric(
+            'verification_health',
+            'Verification Health',
+            overallHealth,
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'verification_issue_endpoint_count',
+            'Verification Issue Endpoint Count',
+            results.issueEndpointCount,
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'verification_warning_endpoint_count',
+            'Verification Warning Endpoint Count',
+            results.warningEndpointCount,
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'verification_failure_count',
+            'Verification Failure Count',
+            results.failureCount,
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'verification_record_count',
+            'Verification Record Count',
+            results.recordCount,
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'verification_data_endpoint_count',
+            'Endpoints With Verification Data',
+            results.dataEndpointCount,
+            configuration
+        ),
+ 
+        createNumberMetric(
+            'endpoint_count',
+            'ShadowControl Endpoint Count',
+            results.endpointCount,
+            configuration
+        )
+    ];
+}
+ 
+/**
+ * @remote_procedure
+ * @label Validate ShadowControl API
+ * @documentation Validates the appliance URL, API token, and current-status response.
+ */
+function validate() {
+    var configuration =
+        getConfiguration();
+ 
+    if (
+        configuration.error
+    ) {
+        failDriver(
+            configuration.error ===
+                'authentication'
+                ? 'authentication'
+                : 'generic'
+        );
+ 
+        return;
+    }
+ 
+    getShadowControlStatus(
+        configuration,
+        function (
+            errorType,
+            status
+        ) {
+            if (errorType) {
+                failDriver(
+                    errorType
+                );
+ 
+                return;
+            }
+ 
+            console.info(
+                'Validated ShadowControl API access. Endpoint records returned: ' +
+                String(
+                    getObjectKeys(
+                        status
+                    ).length
+                )
+            );
+ 
+            D.success();
+        }
+    );
+}
+ 
+/**
+ * @remote_procedure
+ * @label Get ShadowControl Verification Health
+ * @documentation Publishes verification summary metrics and a simplified ID/Failed Verifications table.
+ */
+function get_status() {
+    var configuration =
+        getConfiguration();
+ 
+    if (
+        configuration.error
+    ) {
+        failDriver(
+            configuration.error ===
+                'authentication'
+                ? 'authentication'
+                : 'generic'
+        );
+ 
+        return;
+    }
+ 
+    getShadowControlStatus(
+        configuration,
+        function (
+            errorType,
+            status
+        ) {
+            var results;
+            var metrics;
+            var table;
+ 
+            if (errorType) {
+                failDriver(
+                    errorType
+                );
+ 
+                return;
+            }
+ 
+            results =
+                collectVerificationResults(
+                    status
+                );
+ 
+            metrics =
+                createSummaryMetrics(
+                    results,
+                    configuration
+                );
+ 
+            console.info(
+                'ShadowControl endpoints reviewed: ' +
+                String(
+                    results.endpointCount
+                )
+            );
+ 
+            console.info(
+                'Endpoints with verification data: ' +
+                String(
+                    results.dataEndpointCount
+                )
+            );
+ 
+            console.info(
+                'Verification records reviewed: ' +
+                String(
+                    results.recordCount
+                )
+            );
+ 
+            console.info(
+                'Verification issue endpoints: ' +
+                String(
+                    results.issueEndpointCount
+                )
+            );
+ 
+            console.info(
+                'Verification warning endpoints: ' +
+                String(
+                    results.warningEndpointCount
+                )
+            );
+ 
+            console.info(
+                'Verification failures: ' +
+                String(
+                    results.failureCount
+                )
+            );
+ 
+            if (
+                results.rows.length === 0
+            ) {
+                D.success(
+                    metrics
+                );
+ 
+                return;
+            }
+ 
+            table =
+                createVerificationTable();
+ 
+            addRowsToTable(
+                table,
+                results.rows
+            );
+ 
+            D.success(
+                metrics,
+                table
+            );
+        }
+    );
+}
