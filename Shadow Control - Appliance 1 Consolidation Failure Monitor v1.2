@@ -1,0 +1,1196 @@
+/**
+ * Domotz Custom Integration
+ * Name: Shadow Control - Consolidation Failure Monitor
+ * Version: 1.2.2
+ *
+ * Output table:
+ * - ID
+ * - Failure Matches
+ *
+ * Failure Matches:
+ * - Healthy when consolidation failure count is 0
+ * - Failed when consolidation failure count is greater than 0
+ */
+
+/**
+ * @description ShadowControl appliance URL or hostname
+ * @type TEXT
+ */
+var Appliance = D.getParameter('Appliance');
+
+/**
+ * @description ShadowControl Report API token
+ * @type SECRET_TEXT
+ */
+var Token = D.getParameter('Token');
+
+var STATUS_API_PATH = '/api/reports/status/';
+var REQUEST_TIMEOUT_MS = 45000;
+var MAX_SCAN_DEPTH = 10;
+var MAX_SCAN_NODES_PER_ENDPOINT = 2500;
+var MAX_RECORD_ID_LENGTH = 50;
+
+/*
+ * General helpers
+ */
+
+function isArray(value) {
+    return Array.isArray(value);
+}
+
+function isObject(value) {
+    return (
+        value !== null &&
+        typeof value === 'object' &&
+        !isArray(value)
+    );
+}
+
+function isScalar(value) {
+    return (
+        value === null ||
+        typeof value !== 'object'
+    );
+}
+
+function isEmpty(value) {
+    return (
+        value === null ||
+        typeof value === 'undefined' ||
+        value === ''
+    );
+}
+
+function trimText(value) {
+    if (isEmpty(value)) {
+        return '';
+    }
+
+    return String(value).replace(
+        /^\s+|\s+$/g,
+        ''
+    );
+}
+
+function cleanText(value) {
+    var text;
+
+    if (isEmpty(value)) {
+        return 'N/A';
+    }
+
+    if (typeof value === 'boolean') {
+        return value
+            ? 'True'
+            : 'False';
+    }
+
+    if (isArray(value)) {
+        if (value.length === 0) {
+            return 'N/A';
+        }
+
+        text = value.join(', ');
+    } else if (isObject(value)) {
+        try {
+            text = JSON.stringify(value);
+        } catch (error) {
+            text = '[Object]';
+        }
+    } else {
+        text = String(value);
+    }
+
+    text = text
+        .replace(/[\r\n\t]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^\s+|\s+$/g, '');
+
+    return text || 'N/A';
+}
+
+function getObjectKeys(value) {
+    var keys = [];
+    var key;
+
+    if (!isObject(value)) {
+        return keys;
+    }
+
+    for (key in value) {
+        if (
+            Object.prototype.hasOwnProperty.call(
+                value,
+                key
+            )
+        ) {
+            keys.push(key);
+        }
+    }
+
+    return keys;
+}
+
+function getFirstValue(source, names) {
+    var i;
+    var value;
+
+    if (!isObject(source)) {
+        return null;
+    }
+
+    for (i = 0; i < names.length; i++) {
+        value = source[names[i]];
+
+        if (!isEmpty(value)) {
+            return value;
+        }
+    }
+
+    return null;
+}
+
+function normalize(value) {
+    if (isEmpty(value)) {
+        return '';
+    }
+
+    return String(value)
+        .toLowerCase()
+        .replace(/[_-]+/g, ' ')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .replace(/^\s+|\s+$/g, '');
+}
+
+function containsConsolidation(value) {
+    return (
+        normalize(value).indexOf(
+            'consolidat'
+        ) !== -1
+    );
+}
+
+function containsFailure(value) {
+    var text = normalize(value);
+
+    return (
+        text.indexOf('failed') !== -1 ||
+        text.indexOf('failure') !== -1 ||
+        text.indexOf('error') !== -1 ||
+        text.indexOf('critical') !== -1 ||
+        text.indexOf('broken') !== -1 ||
+        text.indexOf('faulted') !== -1 ||
+        text.indexOf('fatal') !== -1 ||
+        text.indexOf('aborted') !== -1 ||
+        text.indexOf('unable') !== -1 ||
+        text.indexOf('unsuccessful') !== -1 ||
+        text.indexOf('exception') !== -1 ||
+        text.indexOf('corrupt') !== -1 ||
+        text === 'red'
+    );
+}
+
+function isRelevantStatusKey(value) {
+    var text = normalize(value);
+
+    return (
+        text.indexOf('status') !== -1 ||
+        text.indexOf('state') !== -1 ||
+        text.indexOf('result') !== -1 ||
+        text.indexOf('health') !== -1 ||
+        text.indexOf('outcome') !== -1 ||
+        text.indexOf('error') !== -1 ||
+        text.indexOf('failure') !== -1 ||
+        text.indexOf('failed') !== -1 ||
+        text.indexOf('message') !== -1 ||
+        text.indexOf('description') !== -1 ||
+        text.indexOf('detail') !== -1 ||
+        text.indexOf('reason') !== -1
+    );
+}
+
+/*
+ * Appliance configuration
+ */
+
+function parseAppliance() {
+    var raw = trimText(Appliance);
+    var match;
+    var protocol;
+    var host;
+    var port;
+    var basePath;
+    var urlHost;
+    var includePort;
+    var baseUrl;
+
+    if (!raw) {
+        console.error(
+            'Missing Appliance parameter'
+        );
+
+        return {
+            error: 'configuration'
+        };
+    }
+
+    if (!trimText(Token)) {
+        console.error(
+            'Missing ShadowControl Token parameter'
+        );
+
+        return {
+            error: 'authentication'
+        };
+    }
+
+    if (
+        !/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)
+    ) {
+        raw = 'https://' + raw;
+    }
+
+    match = raw.match(
+        /^(https?):\/\/(\[[^\]]+\]|[^\/:?#]+)(?::([0-9]+))?([^?#]*)?(?:\?[^#]*)?(?:#.*)?$/i
+    );
+
+    if (!match) {
+        console.error(
+            'Invalid Appliance URL: ' + raw
+        );
+
+        return {
+            error: 'configuration'
+        };
+    }
+
+    protocol = String(
+        match[1]
+    ).toLowerCase();
+
+    host = String(
+        match[2]
+    );
+
+    if (
+        host.charAt(0) === '[' &&
+        host.charAt(
+            host.length - 1
+        ) === ']'
+    ) {
+        host = host.substring(
+            1,
+            host.length - 1
+        );
+    }
+
+    if (match[3]) {
+        port = parseInt(
+            match[3],
+            10
+        );
+    } else {
+        port = protocol === 'https'
+            ? 443
+            : 80;
+    }
+
+    if (
+        isNaN(port) ||
+        port < 1 ||
+        port > 65535
+    ) {
+        console.error(
+            'Invalid Appliance port'
+        );
+
+        return {
+            error: 'configuration'
+        };
+    }
+
+    basePath = match[4] || '';
+
+    basePath = basePath.replace(
+        /\/+$/g,
+        ''
+    );
+
+    basePath = basePath.replace(
+        /\/api\/reports\/status$/i,
+        ''
+    );
+
+    urlHost = host.indexOf(':') !== -1
+        ? '[' + host + ']'
+        : host;
+
+    includePort = !(
+        protocol === 'https' &&
+        port === 443
+    ) && !(
+        protocol === 'http' &&
+        port === 80
+    );
+
+    baseUrl =
+        protocol +
+        '://' +
+        urlHost +
+        (
+            includePort
+                ? ':' + String(port)
+                : ''
+        ) +
+        basePath;
+
+    return {
+        protocol: protocol,
+        host: host,
+        port: port,
+        requestPath:
+            basePath +
+            STATUS_API_PATH,
+        baseUrl: baseUrl,
+        token: trimText(Token)
+    };
+}
+
+/*
+ * Driver failure handling
+ */
+
+function driverFailure(type, message) {
+    if (message) {
+        console.error(message);
+    }
+
+    if (type === 'authentication') {
+        D.failure(
+            D.errorType.AUTHENTICATION_ERROR
+        );
+
+        return;
+    }
+
+    if (type === 'parsing') {
+        D.failure(
+            D.errorType.PARSING_ERROR
+        );
+
+        return;
+    }
+
+    if (type === 'timeout') {
+        D.failure(
+            D.errorType.TIMEOUT_ERROR
+        );
+
+        return;
+    }
+
+    if (type === 'resource') {
+        D.failure(
+            D.errorType.RESOURCE_UNAVAILABLE
+        );
+
+        return;
+    }
+
+    if (type === 'configuration') {
+        D.failure(
+            D.errorType.PARSING_ERROR
+        );
+
+        return;
+    }
+
+    D.failure(
+        D.errorType.GENERIC_ERROR
+    );
+}
+
+function isTimeoutError(error) {
+    var text;
+
+    if (!error) {
+        return false;
+    }
+
+    text = String(
+        error.message ||
+        error
+    ).toLowerCase();
+
+    return (
+        text.indexOf('timeout') !== -1 ||
+        text.indexOf('timed out') !== -1 ||
+        text.indexOf('etimedout') !== -1
+    );
+}
+
+/*
+ * ShadowControl API request
+ */
+
+function getShadowControlStatus(
+    configuration,
+    callback
+) {
+    var target;
+    var options;
+
+    target = D.createExternalDevice(
+        configuration.host
+    );
+
+    options = {
+        url:
+            configuration.requestPath,
+
+        protocol:
+            configuration.protocol,
+
+        port:
+            configuration.port,
+
+        rejectUnauthorized:
+            false,
+
+        timeout:
+            REQUEST_TIMEOUT_MS,
+
+        headers: {
+            'Accept':
+                'application/json',
+
+            'CMD_TOKEN':
+                configuration.token
+        }
+    };
+
+    console.info(
+        'Requesting ' +
+        configuration.baseUrl +
+        STATUS_API_PATH
+    );
+
+    target.http.get(
+        options,
+        function (
+            error,
+            response,
+            body
+        ) {
+            var statusCode;
+            var text;
+            var parsed;
+
+            if (error) {
+                callback(
+                    isTimeoutError(error)
+                        ? 'timeout'
+                        : 'resource',
+                    null,
+                    String(
+                        error.message ||
+                        error
+                    )
+                );
+
+                return;
+            }
+
+            if (!response) {
+                callback(
+                    'resource',
+                    null,
+                    'ShadowControl returned no HTTP response'
+                );
+
+                return;
+            }
+
+            statusCode = Number(
+                response.statusCode
+            );
+
+            console.info(
+                'ShadowControl HTTP status: ' +
+                String(statusCode)
+            );
+
+            if (
+                statusCode === 401 ||
+                statusCode === 403
+            ) {
+                callback(
+                    'authentication',
+                    null,
+                    'ShadowControl rejected the API token'
+                );
+
+                return;
+            }
+
+            if (statusCode === 408) {
+                callback(
+                    'timeout',
+                    null,
+                    'ShadowControl request timed out'
+                );
+
+                return;
+            }
+
+            if (
+                statusCode === 404 ||
+                statusCode >= 500
+            ) {
+                callback(
+                    'resource',
+                    null,
+                    'ShadowControl API unavailable; HTTP ' +
+                    String(statusCode)
+                );
+
+                return;
+            }
+
+            if (
+                isNaN(statusCode) ||
+                statusCode < 200 ||
+                statusCode >= 300
+            ) {
+                callback(
+                    'resource',
+                    null,
+                    'Unexpected HTTP response: ' +
+                    String(statusCode)
+                );
+
+                return;
+            }
+
+            try {
+                if (typeof body === 'string') {
+                    text = body
+                        .replace(/^\uFEFF/, '')
+                        .replace(
+                            /^\s+|\s+$/g,
+                            ''
+                        );
+
+                    if (!text) {
+                        callback(
+                            'parsing',
+                            null,
+                            'ShadowControl returned an empty response'
+                        );
+
+                        return;
+                    }
+
+                    parsed = JSON.parse(text);
+                } else if (isObject(body)) {
+                    parsed = body;
+                } else {
+                    callback(
+                        'parsing',
+                        null,
+                        'ShadowControl response was not JSON'
+                    );
+
+                    return;
+                }
+            } catch (parseError) {
+                callback(
+                    'parsing',
+                    null,
+                    'JSON parsing error: ' +
+                    String(
+                        parseError.message ||
+                        parseError
+                    )
+                );
+
+                return;
+            }
+
+            if (!isObject(parsed)) {
+                callback(
+                    'parsing',
+                    null,
+                    'ShadowControl response is not an object'
+                );
+
+                return;
+            }
+
+            callback(
+                null,
+                parsed,
+                null
+            );
+        }
+    );
+}
+
+/*
+ * Endpoint response helpers
+ */
+
+function arrayToObjectMap(values) {
+    var result = {};
+    var i;
+    var key;
+
+    for (i = 0; i < values.length; i++) {
+        key = cleanText(
+            getFirstValue(
+                values[i],
+                [
+                    'id',
+                    'endpoint_id',
+                    'endpointId',
+                    'uuid',
+                    'name',
+                    'hostname'
+                ]
+            ) || i
+        );
+
+        result[key] = values[i];
+    }
+
+    return result;
+}
+
+function getEndpointMap(payload) {
+    if (isObject(payload.endpoints)) {
+        return payload.endpoints;
+    }
+
+    if (isArray(payload.endpoints)) {
+        return arrayToObjectMap(
+            payload.endpoints
+        );
+    }
+
+    if (
+        isObject(payload.data) &&
+        isObject(payload.data.endpoints)
+    ) {
+        return payload.data.endpoints;
+    }
+
+    if (
+        isObject(payload.data) &&
+        isArray(payload.data.endpoints)
+    ) {
+        return arrayToObjectMap(
+            payload.data.endpoints
+        );
+    }
+
+    if (
+        isObject(payload.results) &&
+        isObject(payload.results.endpoints)
+    ) {
+        return payload.results.endpoints;
+    }
+
+    return payload;
+}
+
+/*
+ * Consolidation scanner
+ */
+
+function createScanState() {
+    return {
+        nodes: 0,
+        failureMatches: 0,
+        scanLimitReached: false
+    };
+}
+
+function objectContainsConsolidationValue(
+    value
+) {
+    var keys;
+    var i;
+    var child;
+
+    if (!isObject(value)) {
+        return false;
+    }
+
+    keys = getObjectKeys(value);
+
+    for (i = 0; i < keys.length; i++) {
+        child = value[keys[i]];
+
+        if (
+            isScalar(child) &&
+            containsConsolidation(child)
+        ) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function scanForConsolidation(
+    value,
+    insideConsolidation,
+    state,
+    depth
+) {
+    var i;
+    var keys;
+    var key;
+    var child;
+    var keyMarker;
+    var valueMarker;
+    var objectMarker;
+    var childInside;
+    var canEvaluate;
+
+    if (
+        depth > MAX_SCAN_DEPTH ||
+        state.scanLimitReached
+    ) {
+        return;
+    }
+
+    state.nodes += 1;
+
+    if (
+        state.nodes >
+        MAX_SCAN_NODES_PER_ENDPOINT
+    ) {
+        state.scanLimitReached = true;
+        return;
+    }
+
+    if (isArray(value)) {
+        for (i = 0; i < value.length; i++) {
+            scanForConsolidation(
+                value[i],
+                insideConsolidation,
+                state,
+                depth + 1
+            );
+
+            if (state.scanLimitReached) {
+                return;
+            }
+        }
+
+        return;
+    }
+
+    if (!isObject(value)) {
+        return;
+    }
+
+    objectMarker =
+        objectContainsConsolidationValue(
+            value
+        );
+
+    keys = getObjectKeys(value);
+
+    for (i = 0; i < keys.length; i++) {
+        key = keys[i];
+        child = value[key];
+
+        keyMarker =
+            containsConsolidation(key);
+
+        valueMarker =
+            isScalar(child) &&
+            containsConsolidation(child);
+
+        childInside =
+            insideConsolidation ||
+            keyMarker ||
+            objectMarker;
+
+        if (isScalar(child)) {
+            canEvaluate =
+                keyMarker ||
+                (
+                    childInside &&
+                    isRelevantStatusKey(key)
+                ) ||
+                valueMarker;
+
+            if (
+                canEvaluate &&
+                containsFailure(child)
+            ) {
+                state.failureMatches += 1;
+            }
+        } else {
+            scanForConsolidation(
+                child,
+                childInside,
+                state,
+                depth + 1
+            );
+        }
+
+        if (state.scanLimitReached) {
+            return;
+        }
+    }
+}
+
+/*
+ * Analyze one endpoint
+ */
+
+function analyzeEndpoint(
+    endpointKey,
+    endpoint
+) {
+    var state =
+        createScanState();
+
+    var id;
+
+    scanForConsolidation(
+        endpoint,
+        false,
+        state,
+        0
+    );
+
+    id = getFirstValue(
+        endpoint,
+        [
+            'id',
+            'endpoint_id',
+            'endpointId',
+            'uuid',
+            'name',
+            'device_name',
+            'deviceName',
+            'hostname',
+            'host_name',
+            'hostName'
+        ]
+    );
+
+    if (isEmpty(id)) {
+        id = endpointKey;
+    }
+
+    return {
+        id:
+            cleanText(id),
+
+        endpointKey:
+            cleanText(endpointKey),
+
+        failureMatches:
+            state.failureMatches,
+
+        status:
+            state.failureMatches === 0
+                ? 'Healthy'
+                : 'Failed'
+    };
+}
+
+function collectResults(payload) {
+    var endpointMap =
+        getEndpointMap(payload);
+
+    var endpointKeys =
+        getObjectKeys(endpointMap);
+
+    var rows = [];
+    var failedEndpointCount = 0;
+    var i;
+    var endpoint;
+    var row;
+
+    for (i = 0; i < endpointKeys.length; i++) {
+        endpoint =
+            endpointMap[
+                endpointKeys[i]
+            ];
+
+        if (!isObject(endpoint)) {
+            continue;
+        }
+
+        row = analyzeEndpoint(
+            endpointKeys[i],
+            endpoint
+        );
+
+        rows.push(row);
+
+        if (row.failureMatches !== 0) {
+            failedEndpointCount += 1;
+        }
+    }
+
+    return {
+        rows: rows,
+        failedEndpointCount:
+            failedEndpointCount
+    };
+}
+
+/*
+ * Table row ID
+ */
+
+function hashText(value) {
+    var text = String(value);
+    var hash = 0;
+    var i;
+
+    for (i = 0; i < text.length; i++) {
+        hash =
+            ((hash << 5) - hash) +
+            text.charCodeAt(i);
+
+        hash = hash | 0;
+    }
+
+    return (
+        hash >>> 0
+    ).toString(16);
+}
+
+function createRowId(row) {
+    var base =
+        cleanText(row.id);
+
+    var suffix =
+        '-' +
+        hashText(
+            row.endpointKey
+        ).substring(0, 6);
+
+    if (
+        !base ||
+        base === 'N/A'
+    ) {
+        base =
+            cleanText(
+                row.endpointKey
+            );
+    }
+
+    return base.substring(
+        0,
+        MAX_RECORD_ID_LENGTH -
+        suffix.length
+    ) + suffix;
+}
+
+/*
+ * Two-column Domotz table
+ */
+
+function createConsolidationTable() {
+    return D.createTable(
+        'ShadowControl Consolidation Status',
+        [
+            {
+                label: 'ID'
+            },
+            {
+                label: 'Failure Matches'
+            }
+        ]
+    );
+}
+
+function addRows(table, rows) {
+    var i;
+    var row;
+
+    for (i = 0; i < rows.length; i++) {
+        row = rows[i];
+
+        table.addMetrics(
+            createRowId(row),
+            [
+                {
+                    value:
+                        row.id
+                },
+                {
+                    value:
+                        row.status
+                }
+            ]
+        );
+    }
+}
+
+/*
+ * Summary metric for Domotz alerting
+ */
+
+function createFailureMetric(
+    results,
+    configuration
+) {
+    return D.createMetric({
+        uid:
+            'consolidation_failed_endpoint_count',
+
+        name:
+            'Consolidation Failed Endpoint Count',
+
+        value:
+            results.failedEndpointCount,
+
+        unit:
+            '',
+
+        valueType:
+            D.valueType.NUMBER,
+
+        metadata: {
+            url:
+                configuration.baseUrl
+        }
+    });
+}
+
+/**
+ * @remote_procedure
+ * @label Validate ShadowControl API
+ * @documentation Validates the ShadowControl URL and API token.
+ */
+function validate() {
+    var configuration =
+        parseAppliance();
+
+    if (configuration.error) {
+        driverFailure(
+            configuration.error,
+            'ShadowControl configuration validation failed'
+        );
+
+        return;
+    }
+
+    getShadowControlStatus(
+        configuration,
+        function (
+            errorType,
+            status,
+            errorMessage
+        ) {
+            if (errorType) {
+                driverFailure(
+                    errorType,
+                    errorMessage
+                );
+
+                return;
+            }
+
+            console.info(
+                'ShadowControl API validation succeeded'
+            );
+
+            D.success();
+        }
+    );
+}
+
+/**
+ * @remote_procedure
+ * @label Get ShadowControl Consolidation Status
+ * @documentation Returns Healthy or Failed for every ShadowControl endpoint.
+ */
+function get_status() {
+    var configuration =
+        parseAppliance();
+
+    if (configuration.error) {
+        driverFailure(
+            configuration.error,
+            'ShadowControl configuration validation failed'
+        );
+
+        return;
+    }
+
+    getShadowControlStatus(
+        configuration,
+        function (
+            errorType,
+            status,
+            errorMessage
+        ) {
+            var results;
+            var table;
+            var metric;
+
+            if (errorType) {
+                driverFailure(
+                    errorType,
+                    errorMessage
+                );
+
+                return;
+            }
+
+            results =
+                collectResults(status);
+
+            metric =
+                createFailureMetric(
+                    results,
+                    configuration
+                );
+
+            console.info(
+                'Failed consolidation endpoints: ' +
+                String(
+                    results.failedEndpointCount
+                )
+            );
+
+            if (
+                results.rows.length === 0
+            ) {
+                D.success([
+                    metric
+                ]);
+
+                return;
+            }
+
+            table =
+                createConsolidationTable();
+
+            addRows(
+                table,
+                results.rows
+            );
+
+            D.success(
+                [
+                    metric
+                ],
+                table
+            );
+        }
+    );
+}
