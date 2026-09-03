@@ -1,0 +1,1992 @@
+/**
+ * Domotz Custom Driver
+ *
+ * Name:
+ *   Dell PowerVault SAN Drives - Bulk API Production
+ *
+ * Description:
+ *   Retrieves all physical drive information from a Dell
+ *   PowerVault ME5 / ME5024 using the native ME5 HTTP API.
+ *
+ * Transport:
+ *   HTTPS
+ *
+ * API Flow:
+ *
+ *   GET /api/login
+ *       ↓
+ *   Obtain sessionKey
+ *       ↓
+ *   GET /api/show/disks
+ *       ↓
+ *   Parse drives[]
+ *       ↓
+ *   Build Domotz table + summary metrics
+ *       ↓
+ *   D.success()
+ *
+ * Production design:
+ *
+ *   - One login request
+ *   - One bulk show-disks request
+ *   - No per-drive Redfish calls
+ *   - No Redfish SessionService
+ *   - No internal retry loops
+ *   - Exactly one terminal D.success() / D.failure()
+ *   - Missing health is never treated as healthy
+ */
+
+
+/* =========================================================
+ * CONFIGURATION
+ * ======================================================= */
+
+var HTTPS_PORT = 443;
+
+var LOGIN_URL =
+    '/api/login';
+
+var SHOW_DISKS_URL =
+    '/api/show/disks';
+
+
+/*
+ * Production logging.
+ *
+ * Healthy drives are normally NOT logged individually.
+ * Problem/unknown/single-ported drives are logged.
+ */
+var DEBUG = true;
+
+var LOG_HEALTHY_DRIVES = false;
+
+
+/* =========================================================
+ * OUTPUT TABLE
+ * ======================================================= */
+
+var table = D.createTable(
+    'PowerVault Drives',
+    [
+        {
+            label: 'Location',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Serial Number',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Vendor',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Model',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Revision',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Description',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Architecture',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Interface',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Health',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Usage',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Single Ported',
+            valueType: D.valueType.STRING
+        },
+        {
+            label: 'Durable ID',
+            valueType: D.valueType.STRING
+        }
+    ]
+);
+
+
+/* =========================================================
+ * LOGGING
+ * ======================================================= */
+
+function log(message) {
+
+    if (!DEBUG) {
+        return;
+    }
+
+
+    console.log(
+        '[POWERVAULT DRIVES] ' +
+        String(message)
+    );
+}
+
+
+function logError(
+    prefix,
+    error
+) {
+
+    var code =
+        'Unknown';
+
+    var message =
+        'Unknown error';
+
+
+    if (error) {
+
+        if (error.code) {
+
+            code =
+                String(
+                    error.code
+                );
+        }
+
+
+        if (error.message) {
+
+            message =
+                String(
+                    error.message
+                );
+        }
+    }
+
+
+    console.error(
+        '[POWERVAULT DRIVES] ' +
+        prefix +
+        ' | Code=' +
+        code +
+        ' | Message=' +
+        message
+    );
+}
+
+
+/* =========================================================
+ * GENERAL HELPERS
+ * ======================================================= */
+
+function safeString(
+    value,
+    fallback
+) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        String(value).trim() === ''
+    ) {
+
+        if (
+            fallback !== undefined &&
+            fallback !== null
+        ) {
+
+            return String(
+                fallback
+            );
+        }
+
+
+        return 'Not Reported';
+    }
+
+
+    return String(
+        value
+    ).trim();
+}
+
+
+function getDriveProperty(
+    drive,
+    names,
+    fallback
+) {
+
+    if (!drive) {
+
+        return fallback;
+    }
+
+
+    for (
+        var i = 0;
+        i <
+        names.length;
+        i++
+    ) {
+
+        var name =
+            names[i];
+
+
+        if (
+            drive[name] !== undefined &&
+            drive[name] !== null &&
+            String(
+                drive[name]
+            ).trim() !== ''
+        ) {
+
+            return drive[name];
+        }
+    }
+
+
+    return fallback;
+}
+
+
+/* =========================================================
+ * ERROR HELPERS
+ * ======================================================= */
+
+function makeError(
+    type,
+    message
+) {
+
+    return {
+
+        type:
+            type,
+
+        message:
+            message
+    };
+}
+
+
+function getErrorCode(error) {
+
+    if (!error) {
+
+        return '';
+    }
+
+
+    if (error.code) {
+
+        return String(
+            error.code
+        );
+    }
+
+
+    if (error.message) {
+
+        var text =
+            String(
+                error.message
+            );
+
+
+        if (
+            /ETIMEDOUT/i.test(
+                text
+            )
+        ) {
+
+            return 'ETIMEDOUT';
+        }
+
+
+        if (
+            /ECONNRESET/i.test(
+                text
+            )
+        ) {
+
+            return 'ECONNRESET';
+        }
+
+
+        if (
+            /ECONNREFUSED/i.test(
+                text
+            )
+        ) {
+
+            return 'ECONNREFUSED';
+        }
+
+
+        if (
+            /EHOSTUNREACH/i.test(
+                text
+            )
+        ) {
+
+            return 'EHOSTUNREACH';
+        }
+
+
+        if (
+            /ENETUNREACH/i.test(
+                text
+            )
+        ) {
+
+            return 'ENETUNREACH';
+        }
+    }
+
+
+    return '';
+}
+
+
+function classifyTransportError(
+    error,
+    operation
+) {
+
+    var code =
+        getErrorCode(
+            error
+        );
+
+
+    var message =
+        error &&
+        error.message
+            ? String(
+                error.message
+            )
+            : 'Unknown transport error';
+
+
+    if (
+        code ===
+        'ETIMEDOUT'
+    ) {
+
+        return makeError(
+            D.errorType.TIMEOUT_ERROR,
+
+            operation +
+            ' timed out: ' +
+            message
+        );
+    }
+
+
+    return makeError(
+        D.errorType.RESOURCE_UNAVAILABLE,
+
+        operation +
+        ' failed: ' +
+        message
+    );
+}
+
+
+/* =========================================================
+ * COMMON HTTP OPTIONS
+ * ======================================================= */
+
+function getBaseHttpOptions() {
+
+    return {
+
+        protocol:
+            'https',
+
+        port:
+            HTTPS_PORT,
+
+        useHostname:
+            false,
+
+        rejectUnauthorized:
+            false,
+
+        jar:
+            true
+    };
+}
+
+
+/* =========================================================
+ * JSON PARSER
+ * ======================================================= */
+
+function parseJson(
+    body,
+    operation
+) {
+
+    try {
+
+        return {
+
+            ok:
+                true,
+
+            data:
+                JSON.parse(
+                    body || '{}'
+                )
+        };
+
+    } catch (
+        error
+    ) {
+
+        return {
+
+            ok:
+                false,
+
+            error:
+                makeError(
+                    D.errorType.PARSING_ERROR,
+
+                    operation +
+                    ' returned invalid JSON'
+                )
+        };
+    }
+}
+
+
+/* =========================================================
+ * FIND COMMAND STATUS
+ * ======================================================= */
+
+function findCommandStatus(data) {
+
+    if (
+        !data ||
+        !Array.isArray(
+            data.status
+        )
+    ) {
+
+        return null;
+    }
+
+
+    for (
+        var i = 0;
+        i <
+        data.status.length;
+        i++
+    ) {
+
+        var status =
+            data.status[i];
+
+
+        if (
+            status &&
+            (
+                status[
+                    'return-code'
+                ] !== undefined ||
+
+                status[
+                    'response-type'
+                ] !== undefined ||
+
+                status.response !== undefined
+            )
+        ) {
+
+            return status;
+        }
+    }
+
+
+    return null;
+}
+
+
+/* =========================================================
+ * API LOGIN
+ * ======================================================= */
+
+function apiLogin() {
+
+    var deferred =
+        D.q.defer();
+
+
+    log(
+        'Creating PowerVault API session'
+    );
+
+
+    var options =
+        getBaseHttpOptions();
+
+
+    options.url =
+        LOGIN_URL;
+
+
+    options.auth =
+        'basic';
+
+
+    options.username =
+        D.device.username();
+
+
+    options.password =
+        D.device.password();
+
+
+    options.headers = {
+
+        'datatype':
+            'json',
+
+        'Accept':
+            'application/json'
+    };
+
+
+    D.device.http.get(
+        options,
+
+        function(
+            error,
+            response,
+            body
+        ) {
+
+            if (error) {
+
+                logError(
+                    'API login transport failure',
+                    error
+                );
+
+
+                deferred.reject(
+                    classifyTransportError(
+                        error,
+                        'PowerVault API login'
+                    )
+                );
+
+
+                return;
+            }
+
+
+            var statusCode =
+                response &&
+                response.statusCode
+                    ? response.statusCode
+                    : 0;
+
+
+            log(
+                'API login HTTP ' +
+                statusCode
+            );
+
+
+            if (
+                statusCode === 401 ||
+                statusCode === 403
+            ) {
+
+                deferred.reject(
+                    makeError(
+                        D.errorType.AUTHENTICATION_ERROR,
+
+                        'PowerVault rejected the configured credentials'
+                    )
+                );
+
+
+                return;
+            }
+
+
+            if (
+                statusCode !== 200
+            ) {
+
+                deferred.reject(
+                    makeError(
+                        D.errorType.RESOURCE_UNAVAILABLE,
+
+                        'Unexpected PowerVault API login HTTP status ' +
+                        statusCode
+                    )
+                );
+
+
+                return;
+            }
+
+
+            var parsed =
+                parseJson(
+                    body,
+                    'PowerVault API login'
+                );
+
+
+            if (
+                !parsed.ok
+            ) {
+
+                deferred.reject(
+                    parsed.error
+                );
+
+
+                return;
+            }
+
+
+            var data =
+                parsed.data;
+
+
+            if (
+                !data ||
+                !Array.isArray(
+                    data.status
+                )
+            ) {
+
+                deferred.reject(
+                    makeError(
+                        D.errorType.PARSING_ERROR,
+
+                        'PowerVault API login JSON did not contain status[]'
+                    )
+                );
+
+
+                return;
+            }
+
+
+            var sessionKey =
+                null;
+
+
+            for (
+                var i = 0;
+                i <
+                data.status.length;
+                i++
+            ) {
+
+                if (
+                    data.status[i] &&
+                    data.status[i].response !== undefined &&
+                    data.status[i].response !== null &&
+                    String(
+                        data.status[i].response
+                    ).trim() !== ''
+                ) {
+
+                    sessionKey =
+                        String(
+                            data.status[i].response
+                        ).trim();
+
+
+                    break;
+                }
+            }
+
+
+            if (!sessionKey) {
+
+                deferred.reject(
+                    makeError(
+                        D.errorType.PARSING_ERROR,
+
+                        'PowerVault API login did not return a session key'
+                    )
+                );
+
+
+                return;
+            }
+
+
+            log(
+                'PowerVault API session established'
+            );
+
+
+            deferred.resolve(
+                sessionKey
+            );
+        }
+    );
+
+
+    return deferred.promise;
+}
+
+
+/* =========================================================
+ * SHOW DISKS
+ * ======================================================= */
+
+function showDisks(
+    sessionKey
+) {
+
+    var deferred =
+        D.q.defer();
+
+
+    log(
+        'Retrieving all physical disks'
+    );
+
+
+    var options =
+        getBaseHttpOptions();
+
+
+    options.url =
+        SHOW_DISKS_URL;
+
+
+    options.headers = {
+
+        'sessionKey':
+            sessionKey,
+
+        'datatype':
+            'json',
+
+        'Accept':
+            'application/json'
+    };
+
+
+    D.device.http.get(
+        options,
+
+        function(
+            error,
+            response,
+            body
+        ) {
+
+            if (error) {
+
+                logError(
+                    'show disks transport failure',
+                    error
+                );
+
+
+                deferred.reject(
+                    classifyTransportError(
+                        error,
+                        'PowerVault show disks'
+                    )
+                );
+
+
+                return;
+            }
+
+
+            var statusCode =
+                response &&
+                response.statusCode
+                    ? response.statusCode
+                    : 0;
+
+
+            log(
+                'show disks HTTP ' +
+                statusCode
+            );
+
+
+            if (
+                statusCode === 401 ||
+                statusCode === 403
+            ) {
+
+                deferred.reject(
+                    makeError(
+                        D.errorType.AUTHENTICATION_ERROR,
+
+                        'PowerVault rejected the API session'
+                    )
+                );
+
+
+                return;
+            }
+
+
+            if (
+                statusCode !== 200
+            ) {
+
+                deferred.reject(
+                    makeError(
+                        D.errorType.RESOURCE_UNAVAILABLE,
+
+                        'Unexpected show disks HTTP status ' +
+                        statusCode
+                    )
+                );
+
+
+                return;
+            }
+
+
+            var parsed =
+                parseJson(
+                    body,
+                    'PowerVault show disks'
+                );
+
+
+            if (
+                !parsed.ok
+            ) {
+
+                deferred.reject(
+                    parsed.error
+                );
+
+
+                return;
+            }
+
+
+            deferred.resolve(
+                parsed.data
+            );
+        }
+    );
+
+
+    return deferred.promise;
+}
+
+
+/* =========================================================
+ * HEALTH HELPERS
+ * ======================================================= */
+
+function normalizeHealth(value) {
+
+    return safeString(
+        value,
+        'Not Reported'
+    );
+}
+
+
+function isHealthyHealth(value) {
+
+    return (
+        /^ok$/i.test(
+            safeString(
+                value,
+                ''
+            )
+        )
+    );
+}
+
+
+function isUnknownHealth(value) {
+
+    var text =
+        safeString(
+            value,
+            ''
+        );
+
+
+    return (
+        text === '' ||
+        /^not reported$/i.test(
+            text
+        ) ||
+        /^unknown$/i.test(
+            text
+        ) ||
+        /^n\/a$/i.test(
+            text
+        )
+    );
+}
+
+
+/* =========================================================
+ * SINGLE-PORTED HELPER
+ * ======================================================= */
+
+function isSinglePortedEnabled(value) {
+
+    var text =
+        safeString(
+            value,
+            ''
+        );
+
+
+    return (
+        /^enabled$/i.test(
+            text
+        ) ||
+        /^yes$/i.test(
+            text
+        ) ||
+        /^true$/i.test(
+            text
+        )
+    );
+}
+
+
+/* =========================================================
+ * RECORD ID
+ * ======================================================= */
+
+function sanitizeRecordId(value) {
+
+    var text =
+        safeString(
+            value,
+            'drive'
+        );
+
+
+    text =
+        text
+            .replace(
+                /[^a-zA-Z0-9._-]/g,
+                '-'
+            )
+            .replace(
+                /-+/g,
+                '-'
+            )
+            .toLowerCase();
+
+
+    if (
+        text.length > 50
+    ) {
+
+        text =
+            text.slice(
+                0,
+                50
+            );
+    }
+
+
+    return text;
+}
+
+
+/* =========================================================
+ * METRIC HELPERS
+ * ======================================================= */
+
+function addNumberMetric(
+    metrics,
+    uid,
+    name,
+    value
+) {
+
+    metrics.push(
+        D.createMetric({
+
+            uid:
+                uid,
+
+            name:
+                name,
+
+            value:
+                value,
+
+            unit:
+                '',
+
+            valueType:
+                D.valueType.NUMBER
+        })
+    );
+}
+
+
+function addStringMetric(
+    metrics,
+    uid,
+    name,
+    value
+) {
+
+    metrics.push(
+        D.createMetric({
+
+            uid:
+                uid,
+
+            name:
+                name,
+
+            value:
+                safeString(
+                    value,
+                    'Not Reported'
+                ),
+
+            unit:
+                '',
+
+            valueType:
+                D.valueType.STRING
+        })
+    );
+}
+
+
+/* =========================================================
+ * STATE
+ * ======================================================= */
+
+function createState() {
+
+    return {
+
+        totalDisks:
+            0,
+
+        healthyDisks:
+            0,
+
+        problemDisks:
+            0,
+
+        unknownHealthDisks:
+            0,
+
+        singlePortedDisks:
+            0,
+
+        hddCount:
+            0,
+
+        ssdCount:
+            0,
+
+        sasCount:
+            0,
+
+        sataCount:
+            0,
+
+        otherArchitectureCount:
+            0,
+
+        otherInterfaceCount:
+            0
+    };
+}
+
+
+/* =========================================================
+ * PROCESS ONE DRIVE
+ * ======================================================= */
+
+function processDrive(
+    drive,
+    index,
+    state
+) {
+
+    state.totalDisks++;
+
+
+    var location =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'location'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var durableId =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'durable-id'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var serialNumber =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'serial-number'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var vendor =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'vendor'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var model =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'model'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var revision =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'revision'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var description =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'description'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var architecture =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'architecture'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var interfaceType =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'interface'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var health =
+        normalizeHealth(
+            getDriveProperty(
+                drive,
+                [
+                    'health'
+                ],
+                null
+            )
+        );
+
+
+    var usage =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'usage'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    var singlePorted =
+        safeString(
+            getDriveProperty(
+                drive,
+                [
+                    'single-ported'
+                ],
+                null
+            ),
+            'Not Reported'
+        );
+
+
+    /* -----------------------------------------------------
+     * HEALTH COUNTS
+     * -------------------------------------------------- */
+
+    if (
+        isHealthyHealth(
+            health
+        )
+    ) {
+
+        state.healthyDisks++;
+
+    } else if (
+        isUnknownHealth(
+            health
+        )
+    ) {
+
+        state.unknownHealthDisks++;
+
+    } else {
+
+        state.problemDisks++;
+    }
+
+
+    /* -----------------------------------------------------
+     * SINGLE-PORTED COUNT
+     * -------------------------------------------------- */
+
+    if (
+        isSinglePortedEnabled(
+            singlePorted
+        )
+    ) {
+
+        state.singlePortedDisks++;
+    }
+
+
+    /* -----------------------------------------------------
+     * ARCHITECTURE COUNTS
+     * -------------------------------------------------- */
+
+    if (
+        /^hdd$/i.test(
+            architecture
+        )
+    ) {
+
+        state.hddCount++;
+
+    } else if (
+        /^ssd$/i.test(
+            architecture
+        )
+    ) {
+
+        state.ssdCount++;
+
+    } else {
+
+        state.otherArchitectureCount++;
+    }
+
+
+    /* -----------------------------------------------------
+     * INTERFACE COUNTS
+     * -------------------------------------------------- */
+
+    if (
+        /^sas$/i.test(
+            interfaceType
+        )
+    ) {
+
+        state.sasCount++;
+
+    } else if (
+        /^sata$/i.test(
+            interfaceType
+        )
+    ) {
+
+        state.sataCount++;
+
+    } else {
+
+        state.otherInterfaceCount++;
+    }
+
+
+    /* -----------------------------------------------------
+     * STABLE RECORD ID
+     * -------------------------------------------------- */
+
+    var recordKey =
+        durableId;
+
+
+    if (
+        durableId ===
+        'Not Reported'
+    ) {
+
+        recordKey =
+            serialNumber;
+    }
+
+
+    if (
+        recordKey ===
+        'Not Reported'
+    ) {
+
+        recordKey =
+            location;
+    }
+
+
+    if (
+        recordKey ===
+        'Not Reported'
+    ) {
+
+        recordKey =
+            'drive-' +
+            (index + 1);
+    }
+
+
+    var recordId =
+        sanitizeRecordId(
+            recordKey
+        );
+
+
+    table.insertRecord(
+        recordId,
+        [
+            location,
+            serialNumber,
+            vendor,
+            model,
+            revision,
+            description,
+            architecture,
+            interfaceType,
+            health,
+            usage,
+            singlePorted,
+            durableId
+        ]
+    );
+
+
+    /* -----------------------------------------------------
+     * PRODUCTION LOGGING
+     * -------------------------------------------------- */
+
+    if (
+        LOG_HEALTHY_DRIVES ||
+        !isHealthyHealth(
+            health
+        ) ||
+        isSinglePortedEnabled(
+            singlePorted
+        )
+    ) {
+
+        log(
+            'Drive ' +
+            location +
+            ' | Serial=' +
+            serialNumber +
+            ' | Health=' +
+            health +
+            ' | Usage=' +
+            usage +
+            ' | SinglePorted=' +
+            singlePorted
+        );
+    }
+}
+
+
+/* =========================================================
+ * BUILD METRICS
+ * ======================================================= */
+
+function buildMetrics(state) {
+
+    var metrics = [];
+
+
+    addNumberMetric(
+        metrics,
+        'physical-disk-count',
+        'Detected Physical Disk Count',
+        state.totalDisks
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'healthy-disk-count',
+        'Healthy Disk Count',
+        state.healthyDisks
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'disk-problem-count',
+        'Disk Problem Count',
+        state.problemDisks
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'unknown-disk-health-count',
+        'Disk Health Not Reported Count',
+        state.unknownHealthDisks
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'single-ported-disk-count',
+        'Single-Ported Disk Count',
+        state.singlePortedDisks
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'hdd-count',
+        'HDD Count',
+        state.hddCount
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'ssd-count',
+        'SSD Count',
+        state.ssdCount
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'sas-disk-count',
+        'SAS Disk Count',
+        state.sasCount
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'sata-disk-count',
+        'SATA Disk Count',
+        state.sataCount
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'other-architecture-count',
+        'Other Disk Architecture Count',
+        state.otherArchitectureCount
+    );
+
+
+    addNumberMetric(
+        metrics,
+        'other-interface-count',
+        'Other Disk Interface Count',
+        state.otherInterfaceCount
+    );
+
+
+    /*
+     * Collection Status
+     */
+
+    var collectionStatus =
+        state.unknownHealthDisks > 0
+            ? 'PARTIAL'
+            : 'OK';
+
+
+    addStringMetric(
+        metrics,
+        'collection-status',
+        'Collection Status',
+        collectionStatus
+    );
+
+
+    /*
+     * Overall Disk Status
+     */
+
+    var overallStatus =
+        'OK';
+
+
+    if (
+        state.problemDisks > 0
+    ) {
+
+        overallStatus =
+            'Attention Required';
+
+    } else if (
+        state.unknownHealthDisks > 0
+    ) {
+
+        overallStatus =
+            'Health Not Fully Reported';
+    }
+
+
+    addStringMetric(
+        metrics,
+        'overall-disk-status',
+        'Overall Disk Status',
+        overallStatus
+    );
+
+
+    addStringMetric(
+        metrics,
+        'collection-method',
+        'Collection Method',
+        'PowerVault ME5 Bulk API'
+    );
+
+
+    return metrics;
+}
+
+
+/* =========================================================
+ * PROCESS SHOW DISKS RESPONSE
+ * ======================================================= */
+
+function processShowDisks(data) {
+
+    if (!data) {
+
+        return {
+
+            error:
+                makeError(
+                    D.errorType.PARSING_ERROR,
+
+                    'show disks returned an empty response'
+                )
+        };
+    }
+
+
+    /*
+     * Validate command status.
+     */
+    var commandStatus =
+        findCommandStatus(
+            data
+        );
+
+
+    if (
+        commandStatus &&
+        commandStatus[
+            'return-code'
+        ] !== undefined
+    ) {
+
+        var returnCode =
+            Number(
+                commandStatus[
+                    'return-code'
+                ]
+            );
+
+
+        if (
+            returnCode !== 0
+        ) {
+
+            return {
+
+                error:
+                    makeError(
+                        D.errorType.GENERIC_ERROR,
+
+                        'show disks returned command return-code ' +
+                        returnCode +
+                        ': ' +
+                        safeString(
+                            commandStatus.response,
+                            'Command failed'
+                        )
+                    )
+            };
+        }
+    }
+
+
+    /*
+     * Verify bulk disk array.
+     */
+    if (
+        !Array.isArray(
+            data.drives
+        )
+    ) {
+
+        return {
+
+            error:
+                makeError(
+                    D.errorType.PARSING_ERROR,
+
+                    'show disks response did not contain drives[]'
+                )
+        };
+    }
+
+
+    if (
+        data.drives.length === 0
+    ) {
+
+        return {
+
+            error:
+                makeError(
+                    D.errorType.PARSING_ERROR,
+
+                    'show disks returned an empty drives[] array'
+                )
+        };
+    }
+
+
+    var state =
+        createState();
+
+
+    for (
+        var i = 0;
+        i <
+        data.drives.length;
+        i++
+    ) {
+
+        processDrive(
+            data.drives[i],
+            i,
+            state
+        );
+    }
+
+
+    return {
+
+        state:
+            state,
+
+        metrics:
+            buildMetrics(
+                state
+            )
+    };
+}
+
+
+/* =========================================================
+ * VALIDATE
+ *
+ * Lightweight on purpose.
+ *
+ * Only validate API authentication.
+ * ======================================================= */
+
+/**
+ * @remote_procedure
+ * @label Validate Dell PowerVault Drives
+ * @documentation Validates Dell PowerVault ME5 native bulk API authentication.
+ */
+function validate() {
+
+    log(
+        '================================'
+    );
+
+
+    log(
+        'Starting PowerVault Drives validation'
+    );
+
+
+    apiLogin()
+
+    .then(
+        function(sessionKey) {
+
+            log(
+                'Validation successful'
+            );
+
+
+            return D.success();
+        }
+    )
+
+    .catch(
+        function(error) {
+
+            if (
+                error &&
+                error.message
+            ) {
+
+                console.error(
+                    '[POWERVAULT DRIVES] ' +
+                    error.message
+                );
+            }
+
+
+            return D.failure(
+                error &&
+                error.type
+                    ? error.type
+                    : D.errorType.GENERIC_ERROR
+            );
+        }
+    );
+}
+
+
+/* =========================================================
+ * GET STATUS
+ * ======================================================= */
+
+/**
+ * @remote_procedure
+ * @label Get PowerVault Drives
+ * @documentation Retrieves all Dell PowerVault ME5 physical disks using the native bulk show disks API.
+ */
+function get_status() {
+
+    log(
+        '================================'
+    );
+
+
+    log(
+        'Starting PowerVault physical disk collection'
+    );
+
+
+    apiLogin()
+
+    .then(
+        function(sessionKey) {
+
+            return showDisks(
+                sessionKey
+            );
+        }
+    )
+
+    .then(
+        function(data) {
+
+            var result =
+                processShowDisks(
+                    data
+                );
+
+
+            if (
+                result.error
+            ) {
+
+                var deferred =
+                    D.q.defer();
+
+
+                deferred.reject(
+                    result.error
+                );
+
+
+                return deferred.promise;
+            }
+
+
+            var state =
+                result.state;
+
+
+            log(
+                '--------------------------------'
+            );
+
+
+            log(
+                'Detected disks=' +
+                state.totalDisks
+            );
+
+
+            log(
+                'Healthy disks=' +
+                state.healthyDisks
+            );
+
+
+            log(
+                'Disk problems=' +
+                state.problemDisks
+            );
+
+
+            log(
+                'Health not reported=' +
+                state.unknownHealthDisks
+            );
+
+
+            log(
+                'Single-ported disks=' +
+                state.singlePortedDisks
+            );
+
+
+            log(
+                'HDD=' +
+                state.hddCount +
+                ' | SSD=' +
+                state.ssdCount
+            );
+
+
+            log(
+                'SAS=' +
+                state.sasCount +
+                ' | SATA=' +
+                state.sataCount
+            );
+
+
+            log(
+                'PowerVault drive collection completed successfully'
+            );
+
+
+            return D.success(
+                result.metrics,
+                table
+            );
+        }
+    )
+
+    .catch(
+        function(error) {
+
+            if (
+                error &&
+                error.message
+            ) {
+
+                console.error(
+                    '[POWERVAULT DRIVES] ' +
+                    error.message
+                );
+            }
+
+
+            return D.failure(
+                error &&
+                error.type
+                    ? error.type
+                    : D.errorType.GENERIC_ERROR
+            );
+        }
+    );
+}
