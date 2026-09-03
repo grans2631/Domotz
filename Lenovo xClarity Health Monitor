@@ -1,0 +1,3400 @@
+/**
+ * Domotz Custom Driver
+ *
+ * Name:
+ *   Lenovo XClarity Unified Hardware Health
+ *
+ * Description:
+ *   Consolidated hardware-health monitoring for Lenovo
+ *   XClarity Controller using SSH.
+ *
+ * Commands:
+ *
+ *   syshealth summary
+ *   syshealth cooling
+ *   syshealth storage
+ *   syshealth memory
+ *   syshealth power
+ *   syshealth processors
+ *   temps
+ *
+ * Architecture:
+ *
+ *   Sequential sendSSHCommand() execution.
+ *
+ * IMPORTANT:
+ *
+ *   - sendSSHCommands() is NOT used.
+ *   - One command is executed at a time.
+ *   - One terminal D.success() / D.failure().
+ *   - Missing health is not inferred to be OK.
+ *
+ * TABLE CHANGE:
+ *
+ *   The Domotz record ID and Component column now use
+ *   the same normalized component name.
+ *
+ * Example:
+ *
+ *     ID            Component
+ *     fan-1         fan-1
+ *     dimm-1        dimm-1
+ *     processor-1   processor-1
+ */
+
+
+/* =========================================================
+ * CONFIGURATION
+ * ======================================================= */
+
+var SSH_TIMEOUT = 30000;
+
+var DEBUG = true;
+
+var LOG_RAW_OUTPUT = false;
+
+var RAW_OUTPUT_LIMIT = 2000;
+
+
+/* =========================================================
+ * COMMAND DEFINITIONS
+ * ======================================================= */
+
+var COMMANDS = [
+
+    {
+        key: 'summary',
+        label: 'Summary',
+        command: 'syshealth summary'
+    },
+
+    {
+        key: 'cooling',
+        label: 'Cooling',
+        command: 'syshealth cooling'
+    },
+
+    {
+        key: 'storage',
+        label: 'Storage',
+        command: 'syshealth storage'
+    },
+
+    {
+        key: 'memory',
+        label: 'Memory',
+        command: 'syshealth memory'
+    },
+
+    {
+        key: 'power',
+        label: 'Power',
+        command: 'syshealth power'
+    },
+
+    {
+        key: 'processors',
+        label: 'Processors',
+        command: 'syshealth processors'
+    },
+
+    {
+        key: 'temperatures',
+        label: 'Temperatures',
+        command: 'temps'
+    }
+];
+
+
+/* =========================================================
+ * TABLE
+ * ======================================================= */
+
+var hardwareTable =
+    D.createTable(
+        'XClarity Hardware Details',
+        [
+            {
+                label: 'Category',
+                valueType: D.valueType.STRING
+            },
+            {
+                label: 'Component',
+                valueType: D.valueType.STRING
+            },
+            {
+                label: 'Health',
+                valueType: D.valueType.STRING
+            },
+            {
+                label: 'Reading',
+                valueType: D.valueType.STRING
+            },
+            {
+                label: 'Type / Model',
+                valueType: D.valueType.STRING
+            },
+            {
+                label: 'Details',
+                valueType: D.valueType.STRING
+            }
+        ]
+    );
+
+
+/* =========================================================
+ * LOGGING
+ * ======================================================= */
+
+function log(message) {
+
+    if (!DEBUG) {
+        return;
+    }
+
+
+    console.log(
+        '[XCLARITY] ' +
+        String(message)
+    );
+}
+
+
+function logError(
+    prefix,
+    error
+) {
+
+    var code =
+        'Unknown';
+
+    var message =
+        'Unknown error';
+
+
+    if (error) {
+
+        if (
+            error.code !== undefined &&
+            error.code !== null
+        ) {
+
+            code =
+                String(error.code);
+        }
+
+
+        if (error.message) {
+
+            message =
+                String(error.message);
+        }
+    }
+
+
+    console.error(
+        '[XCLARITY] ' +
+        prefix +
+        ' | Code=' +
+        code +
+        ' | Message=' +
+        message
+    );
+}
+
+
+function logRaw(
+    label,
+    output
+) {
+
+    if (
+        !DEBUG ||
+        !LOG_RAW_OUTPUT
+    ) {
+
+        return;
+    }
+
+
+    var text =
+        output === null ||
+        output === undefined
+            ? ''
+            : String(output);
+
+
+    log(
+        'RAW ' +
+        label +
+        ':\n' +
+        text.slice(
+            0,
+            RAW_OUTPUT_LIMIT
+        )
+    );
+}
+
+
+/* =========================================================
+ * GENERAL HELPERS
+ * ======================================================= */
+
+function safeString(
+    value,
+    fallback
+) {
+
+    if (
+        value === null ||
+        value === undefined ||
+        String(value).trim() === ''
+    ) {
+
+        if (
+            fallback !== undefined &&
+            fallback !== null
+        ) {
+
+            return String(fallback);
+        }
+
+
+        return 'Not Reported';
+    }
+
+
+    return String(value).trim();
+}
+
+
+function safeNumber(
+    value,
+    fallback
+) {
+
+    var number =
+        parseFloat(value);
+
+
+    if (
+        isNaN(number)
+    ) {
+
+        return fallback;
+    }
+
+
+    return number;
+}
+
+
+function joinDetails(parts) {
+
+    var result = [];
+
+
+    for (
+        var i = 0;
+        i < parts.length;
+        i++
+    ) {
+
+        if (
+            parts[i] !== null &&
+            parts[i] !== undefined &&
+            String(parts[i]).trim() !== ''
+        ) {
+
+            result.push(
+                String(parts[i]).trim()
+            );
+        }
+    }
+
+
+    if (
+        result.length === 0
+    ) {
+
+        return 'N/A';
+    }
+
+
+    return result.join(
+        ' | '
+    );
+}
+
+
+/* =========================================================
+ * COMPONENT / RECORD ID NORMALIZATION
+ *
+ * IMPORTANT:
+ *
+ * The normalized component value is now used BOTH as:
+ *
+ *   1. Domotz table record ID
+ *   2. Component column value
+ *
+ * Therefore the visible ID and Component match.
+ * ======================================================= */
+
+function normalizeComponent(value) {
+
+    var text =
+        safeString(
+            value,
+            'component'
+        );
+
+
+    text =
+        text
+            .replace(
+                /[^a-zA-Z0-9._-]/g,
+                '-'
+            )
+            .replace(
+                /-+/g,
+                '-'
+            )
+            .replace(
+                /^-+/,
+                ''
+            )
+            .replace(
+                /-+$/,
+                ''
+            )
+            .toLowerCase();
+
+
+    if (
+        text.length > 50
+    ) {
+
+        text =
+            text.slice(
+                0,
+                50
+            );
+    }
+
+
+    if (
+        text === ''
+    ) {
+
+        return 'component';
+    }
+
+
+    return text;
+}
+
+
+/* =========================================================
+ * ERROR HELPERS
+ * ======================================================= */
+
+function makeError(
+    type,
+    message
+) {
+
+    return {
+
+        type: type,
+
+        message: message
+    };
+}
+
+
+function classifySshError(error) {
+
+    if (!error) {
+
+        return makeError(
+            D.errorType.GENERIC_ERROR,
+            'Unknown SSH failure'
+        );
+    }
+
+
+    var code =
+        error.code !== undefined &&
+        error.code !== null
+            ? Number(error.code)
+            : null;
+
+
+    var message =
+        error.message
+            ? String(error.message)
+            : String(error);
+
+
+    if (
+        code === 5
+    ) {
+
+        return makeError(
+            D.errorType.AUTHENTICATION_ERROR,
+            message
+        );
+    }
+
+
+    if (
+        code === 255
+    ) {
+
+        return makeError(
+            D.errorType.RESOURCE_UNAVAILABLE,
+            message
+        );
+    }
+
+
+    if (
+        /authentication/i.test(message) ||
+        /permission denied/i.test(message)
+    ) {
+
+        return makeError(
+            D.errorType.AUTHENTICATION_ERROR,
+            message
+        );
+    }
+
+
+    if (
+        /timed out/i.test(message) ||
+        /timeout/i.test(message)
+    ) {
+
+        return makeError(
+            D.errorType.TIMEOUT_ERROR,
+            message
+        );
+    }
+
+
+    if (
+        /connection refused/i.test(message) ||
+        /connection reset/i.test(message) ||
+        /socket hang up/i.test(message) ||
+        /unreachable/i.test(message)
+    ) {
+
+        return makeError(
+            D.errorType.RESOURCE_UNAVAILABLE,
+            message
+        );
+    }
+
+
+    return makeError(
+        D.errorType.GENERIC_ERROR,
+        message
+    );
+}
+
+
+/* =========================================================
+ * CREDENTIALS
+ * ======================================================= */
+
+function getSshCredentials() {
+
+    var username = null;
+
+    var password = null;
+
+
+    try {
+
+        username =
+            D.device.username();
+
+    } catch (
+        usernameError
+    ) {
+
+        return {
+
+            error:
+                makeError(
+                    D.errorType.AUTHENTICATION_ERROR,
+
+                    'SSH management credentials are not configured for this device'
+                )
+        };
+    }
+
+
+    try {
+
+        password =
+            D.device.password();
+
+    } catch (
+        passwordError
+    ) {
+
+        return {
+
+            error:
+                makeError(
+                    D.errorType.AUTHENTICATION_ERROR,
+
+                    'SSH management credentials are not configured for this device'
+                )
+        };
+    }
+
+
+    if (
+        username === null ||
+        username === undefined ||
+        String(username).trim() === ''
+    ) {
+
+        return {
+
+            error:
+                makeError(
+                    D.errorType.AUTHENTICATION_ERROR,
+
+                    'SSH username is not configured'
+                )
+        };
+    }
+
+
+    if (
+        password === null ||
+        password === undefined ||
+        String(password) === ''
+    ) {
+
+        return {
+
+            error:
+                makeError(
+                    D.errorType.AUTHENTICATION_ERROR,
+
+                    'SSH password is not configured'
+                )
+        };
+    }
+
+
+    return {
+
+        username:
+            String(username),
+
+        password:
+            String(password)
+    };
+}
+
+
+/* =========================================================
+ * SSH COMMAND EXECUTION
+ * ======================================================= */
+
+function executeCommand(command) {
+
+    var deferred =
+        D.q.defer();
+
+
+    var credentials =
+        getSshCredentials();
+
+
+    if (
+        credentials.error
+    ) {
+
+        deferred.reject(
+            credentials.error
+        );
+
+
+        return deferred.promise;
+    }
+
+
+    var sshConfig = {
+
+        username:
+            credentials.username,
+
+        password:
+            credentials.password,
+
+        timeout:
+            SSH_TIMEOUT,
+
+        keyboard_interactive:
+            true,
+
+        command:
+            command
+    };
+
+
+    log(
+        'SSH START: ' +
+        command
+    );
+
+
+    D.device.sendSSHCommand(
+        sshConfig,
+
+        function(
+            output,
+            error
+        ) {
+
+            if (
+                error
+            ) {
+
+                logError(
+                    'SSH failed: ' +
+                    command,
+                    error
+                );
+
+
+                deferred.reject(
+                    classifySshError(
+                        error
+                    )
+                );
+
+
+                return;
+            }
+
+
+            var text =
+                output === null ||
+                output === undefined
+                    ? ''
+                    : String(output);
+
+
+            log(
+                'SSH COMPLETE: ' +
+                command +
+                ' | Output length=' +
+                text.length
+            );
+
+
+            deferred.resolve(
+                text
+            );
+        }
+    );
+
+
+    return deferred.promise;
+}
+
+
+/* =========================================================
+ * SEQUENTIAL COMMAND COLLECTOR
+ * ======================================================= */
+
+function executeCommandsSequentially(
+    index,
+    outputs
+) {
+
+    if (
+        index >=
+        COMMANDS.length
+    ) {
+
+        var finished =
+            D.q.defer();
+
+
+        finished.resolve(
+            outputs
+        );
+
+
+        return finished.promise;
+    }
+
+
+    var definition =
+        COMMANDS[index];
+
+
+    log(
+        '--------------------------------'
+    );
+
+
+    log(
+        'Command ' +
+        (index + 1) +
+        ' of ' +
+        COMMANDS.length +
+        ': ' +
+        definition.command
+    );
+
+
+    return executeCommand(
+        definition.command
+    )
+
+    .then(
+        function(output) {
+
+            outputs[
+                definition.key
+            ] =
+                output;
+
+
+            return executeCommandsSequentially(
+                index + 1,
+                outputs
+            );
+        }
+    );
+}
+
+
+/* =========================================================
+ * COMMAND OUTPUT ERROR DETECTION
+ * ======================================================= */
+
+function outputContainsCommandError(output) {
+
+    if (
+        output === null ||
+        output === undefined
+    ) {
+
+        return false;
+    }
+
+
+    var text =
+        String(output);
+
+
+    return (
+        /Error:\s*Command not recognized/i.test(text) ||
+        /Invalid command/i.test(text) ||
+        /Unknown command/i.test(text)
+    );
+}
+
+
+/* =========================================================
+ * LINE HELPERS
+ * ======================================================= */
+
+function getLines(output) {
+
+    return safeString(
+        output,
+        ''
+    )
+    .replace(
+        /\r/g,
+        ''
+    )
+    .split(
+        '\n'
+    );
+}
+
+
+function isSeparatorLine(line) {
+
+    if (!line) {
+
+        return true;
+    }
+
+
+    var text =
+        String(line).trim();
+
+
+    if (
+        text === ''
+    ) {
+
+        return true;
+    }
+
+
+    if (
+        /^[-=_\s]+$/.test(text)
+    ) {
+
+        return true;
+    }
+
+
+    return false;
+}
+
+
+/* =========================================================
+ * HEALTH CLASSIFICATION
+ * ======================================================= */
+
+function classifyHealth(value) {
+
+    var text =
+        safeString(
+            value,
+            ''
+        );
+
+
+    if (
+        text === '' ||
+        /^unknown$/i.test(text) ||
+        /^not reported$/i.test(text) ||
+        /^n\/a$/i.test(text)
+    ) {
+
+        return 'UNKNOWN';
+    }
+
+
+    if (
+        /^ok$/i.test(text) ||
+        /^normal$/i.test(text) ||
+        /^good$/i.test(text) ||
+        /^healthy$/i.test(text)
+    ) {
+
+        return 'OK';
+    }
+
+
+    if (
+        /warning/i.test(text) ||
+        /critical/i.test(text) ||
+        /failed/i.test(text) ||
+        /failure/i.test(text) ||
+        /fault/i.test(text) ||
+        /degraded/i.test(text) ||
+        /error/i.test(text) ||
+        /non-recoverable/i.test(text) ||
+        /offline/i.test(text)
+    ) {
+
+        return 'PROBLEM';
+    }
+
+
+    return 'UNKNOWN';
+}
+
+
+/* =========================================================
+ * STATE
+ * ======================================================= */
+
+function createState() {
+
+    return {
+
+        metrics: [],
+
+        collectionProblemCount: 0,
+
+
+        systemState:
+            'Not Reported',
+
+        restartCount:
+            null,
+
+        summaryCooling:
+            'Not Reported',
+
+        summaryStorage:
+            'Not Reported',
+
+        summaryProcessors:
+            'Not Reported',
+
+        summaryMemory:
+            'Not Reported',
+
+        summarySystem:
+            'Not Reported',
+
+
+        coolingCount: 0,
+        coolingProblemCount: 0,
+        coolingUnknownCount: 0,
+
+
+        storageCount: 0,
+        storageProblemCount: 0,
+        storageUnknownCount: 0,
+
+
+        memoryCount: 0,
+        memoryProblemCount: 0,
+        memoryUnknownCount: 0,
+        totalMemoryGB: 0,
+
+
+        powerSupplyCount: 0,
+        powerSupplyProblemCount: 0,
+        powerSupplyUnknownCount: 0,
+        totalRatedPowerWatts: 0,
+
+
+        processorCount: 0,
+        processorProblemCount: 0,
+        processorUnknownCount: 0,
+
+
+        temperatureCount: 0,
+        temperatureProblemCount: 0,
+        temperatureUnknownCount: 0,
+        highestTemperatureC: null,
+
+
+        hardwareProblemCount: 0,
+
+        unknownHealthCount: 0
+    };
+}
+
+
+/* =========================================================
+ * APPLY HEALTH
+ * ======================================================= */
+
+function applyHealth(
+    state,
+    category,
+    health
+) {
+
+    var classification =
+        classifyHealth(
+            health
+        );
+
+
+    if (
+        category === 'Cooling'
+    ) {
+
+        state.coolingCount++;
+
+
+        if (
+            classification === 'PROBLEM'
+        ) {
+
+            state.coolingProblemCount++;
+
+        } else if (
+            classification === 'UNKNOWN'
+        ) {
+
+            state.coolingUnknownCount++;
+        }
+    }
+
+
+    if (
+        category === 'Storage'
+    ) {
+
+        state.storageCount++;
+
+
+        if (
+            classification === 'PROBLEM'
+        ) {
+
+            state.storageProblemCount++;
+
+        } else if (
+            classification === 'UNKNOWN'
+        ) {
+
+            state.storageUnknownCount++;
+        }
+    }
+
+
+    if (
+        category === 'Memory'
+    ) {
+
+        state.memoryCount++;
+
+
+        if (
+            classification === 'PROBLEM'
+        ) {
+
+            state.memoryProblemCount++;
+
+        } else if (
+            classification === 'UNKNOWN'
+        ) {
+
+            state.memoryUnknownCount++;
+        }
+    }
+
+
+    if (
+        category === 'Power'
+    ) {
+
+        state.powerSupplyCount++;
+
+
+        if (
+            classification === 'PROBLEM'
+        ) {
+
+            state.powerSupplyProblemCount++;
+
+        } else if (
+            classification === 'UNKNOWN'
+        ) {
+
+            state.powerSupplyUnknownCount++;
+        }
+    }
+
+
+    if (
+        category === 'Processor'
+    ) {
+
+        state.processorCount++;
+
+
+        if (
+            classification === 'PROBLEM'
+        ) {
+
+            state.processorProblemCount++;
+
+        } else if (
+            classification === 'UNKNOWN'
+        ) {
+
+            state.processorUnknownCount++;
+        }
+    }
+
+
+    if (
+        category === 'Temperature'
+    ) {
+
+        state.temperatureCount++;
+
+
+        if (
+            classification === 'PROBLEM'
+        ) {
+
+            state.temperatureProblemCount++;
+
+        } else if (
+            classification === 'UNKNOWN'
+        ) {
+
+            state.temperatureUnknownCount++;
+        }
+    }
+}
+
+
+/* =========================================================
+ * TABLE ROW
+ *
+ * ID AND COMPONENT NOW MATCH.
+ * ======================================================= */
+
+function addHardwareRow(
+    prefix,
+    index,
+    category,
+    component,
+    health,
+    reading,
+    type,
+    details
+) {
+
+    /*
+     * Normalize component ONCE.
+     *
+     * This becomes both:
+     *
+     *   - the Domotz record ID
+     *   - the Component displayed in the table
+     */
+    var normalizedComponent =
+        normalizeComponent(
+            component
+        );
+
+
+    hardwareTable.insertRecord(
+        normalizedComponent,
+        [
+            safeString(
+                category,
+                'Not Reported'
+            ),
+
+            normalizedComponent,
+
+            safeString(
+                health,
+                'Not Reported'
+            ),
+
+            safeString(
+                reading,
+                'N/A'
+            ),
+
+            safeString(
+                type,
+                'N/A'
+            ),
+
+            safeString(
+                details,
+                'N/A'
+            )
+        ]
+    );
+}
+
+
+/* =========================================================
+ * SUMMARY PARSER
+ * ======================================================= */
+
+function parseSummary(
+    output,
+    state
+) {
+
+    logRaw(
+        'SUMMARY',
+        output
+    );
+
+
+    if (
+        outputContainsCommandError(
+            output
+        )
+    ) {
+
+        log(
+            'Summary command unsupported'
+        );
+
+
+        state.collectionProblemCount++;
+
+
+        return;
+    }
+
+
+    var lines =
+        getLines(
+            output
+        );
+
+
+    var found = 0;
+
+
+    for (
+        var i = 0;
+        i < lines.length;
+        i++
+    ) {
+
+        var line =
+            lines[i];
+
+        var match;
+
+
+        match =
+            line.match(
+                /^\s*State\s+(.+?)\s*$/
+            );
+
+
+        if (match) {
+
+            state.systemState =
+                safeString(
+                    match[1],
+                    'Not Reported'
+                );
+
+            found++;
+
+            continue;
+        }
+
+
+        match =
+            line.match(
+                /^\s*Restarts\s+(\d+)\s*$/
+            );
+
+
+        if (match) {
+
+            state.restartCount =
+                parseInt(
+                    match[1],
+                    10
+                );
+
+            found++;
+
+            continue;
+        }
+
+
+        match =
+            line.match(
+                /^\s*Cooling Devices\s+(.+?)\s*$/
+            );
+
+
+        if (match) {
+
+            state.summaryCooling =
+                safeString(
+                    match[1],
+                    'Not Reported'
+                );
+
+            found++;
+
+            continue;
+        }
+
+
+        match =
+            line.match(
+                /^\s*Local Storage\s+(.+?)\s*$/
+            );
+
+
+        if (match) {
+
+            state.summaryStorage =
+                safeString(
+                    match[1],
+                    'Not Reported'
+                );
+
+            found++;
+
+            continue;
+        }
+
+
+        match =
+            line.match(
+                /^\s*Processors\s+(.+?)\s*$/
+            );
+
+
+        if (match) {
+
+            state.summaryProcessors =
+                safeString(
+                    match[1],
+                    'Not Reported'
+                );
+
+            found++;
+
+            continue;
+        }
+
+
+        match =
+            line.match(
+                /^\s*Memory\s+(.+?)\s*$/
+            );
+
+
+        if (match) {
+
+            state.summaryMemory =
+                safeString(
+                    match[1],
+                    'Not Reported'
+                );
+
+            found++;
+
+            continue;
+        }
+
+
+        match =
+            line.match(
+                /^\s*System\s+(.+?)\s*$/
+            );
+
+
+        if (match) {
+
+            state.summarySystem =
+                safeString(
+                    match[1],
+                    'Not Reported'
+                );
+
+            found++;
+        }
+    }
+
+
+    if (
+        found === 0
+    ) {
+
+        log(
+            'Summary parser found no recognized fields'
+        );
+
+
+        state.collectionProblemCount++;
+    }
+
+
+    addHardwareRow(
+        '01-system',
+        1,
+        'System',
+        'System Summary',
+        state.summarySystem,
+        state.systemState,
+        'XClarity',
+        joinDetails(
+            [
+                state.restartCount !== null
+                    ? 'Restarts: ' +
+                      state.restartCount
+                    : null,
+
+                'Cooling: ' +
+                state.summaryCooling,
+
+                'Storage: ' +
+                state.summaryStorage,
+
+                'Processors: ' +
+                state.summaryProcessors,
+
+                'Memory: ' +
+                state.summaryMemory
+            ]
+        )
+    );
+}
+
+
+/* =========================================================
+ * COOLING PARSER
+ * ======================================================= */
+
+function parseCooling(
+    output,
+    state
+) {
+
+    logRaw(
+        'COOLING',
+        output
+    );
+
+
+    if (
+        outputContainsCommandError(
+            output
+        )
+    ) {
+
+        log(
+            'Cooling command unsupported'
+        );
+
+
+        state.collectionProblemCount++;
+
+
+        return;
+    }
+
+
+    var lines =
+        getLines(
+            output
+        );
+
+
+    var rowIndex = 0;
+
+
+    for (
+        var i = 2;
+        i < lines.length;
+        i++
+    ) {
+
+        var line =
+            lines[i].trim();
+
+
+        if (
+            isSeparatorLine(
+                line
+            )
+        ) {
+
+            continue;
+        }
+
+
+        var values =
+            line.split(
+                /\s+/
+            );
+
+
+        if (
+            values.length < 4
+        ) {
+
+            continue;
+        }
+
+
+        var status =
+            values[
+                values.length - 1
+            ];
+
+
+        var percentage =
+            safeNumber(
+                values[
+                    values.length - 2
+                ],
+                null
+            );
+
+
+        var speed =
+            safeNumber(
+                values[
+                    values.length - 3
+                ],
+                null
+            );
+
+
+        if (
+            speed === null &&
+            percentage === null
+        ) {
+
+            continue;
+        }
+
+
+        var component =
+            values
+                .slice(
+                    0,
+                    values.length - 3
+                )
+                .join(
+                    ' '
+                );
+
+
+        if (
+            component === ''
+        ) {
+
+            continue;
+        }
+
+
+        rowIndex++;
+
+
+        applyHealth(
+            state,
+            'Cooling',
+            status
+        );
+
+
+        addHardwareRow(
+            '02-cooling',
+            rowIndex,
+            'Cooling',
+            component,
+            status,
+
+            joinDetails(
+                [
+                    speed !== null
+                        ? speed +
+                          ' RPM'
+                        : null,
+
+                    percentage !== null
+                        ? percentage +
+                          '%'
+                        : null
+                ]
+            ),
+
+            'Fan',
+
+            joinDetails(
+                [
+                    speed !== null
+                        ? 'Speed: ' +
+                          speed +
+                          ' RPM'
+                        : null,
+
+                    percentage !== null
+                        ? 'Speed: ' +
+                          percentage +
+                          '%'
+                        : null
+                ]
+            )
+        );
+    }
+
+
+    if (
+        rowIndex === 0
+    ) {
+
+        log(
+            'Cooling parser found no component rows'
+        );
+
+
+        state.collectionProblemCount++;
+    }
+}
+
+
+/* =========================================================
+ * STORAGE PARSER
+ * ======================================================= */
+
+function parseStorage(
+    output,
+    state
+) {
+
+    logRaw(
+        'STORAGE',
+        output
+    );
+
+
+    if (
+        outputContainsCommandError(
+            output
+        )
+    ) {
+
+        log(
+            'Storage command unsupported'
+        );
+
+
+        state.collectionProblemCount++;
+
+
+        return;
+    }
+
+
+    var cleaned =
+        safeString(
+            output,
+            ''
+        )
+        .replace(
+            /Flash DIMMs[\s\S]*$/i,
+            ''
+        );
+
+
+    var lines =
+        getLines(
+            cleaned
+        );
+
+
+    var rowIndex = 0;
+
+
+    for (
+        var i = 3;
+        i < lines.length;
+        i++
+    ) {
+
+        var line =
+            lines[i].trim();
+
+
+        if (
+            isSeparatorLine(
+                line
+            )
+        ) {
+
+            continue;
+        }
+
+
+        var values =
+            line.split(
+                /\s+/
+            );
+
+
+        if (
+            values.length < 2
+        ) {
+
+            continue;
+        }
+
+
+        var status =
+            values[
+                values.length - 1
+            ];
+
+
+        var component =
+            values
+                .slice(
+                    0,
+                    values.length - 1
+                )
+                .join(
+                    ' '
+                );
+
+
+        if (
+            component === ''
+        ) {
+
+            continue;
+        }
+
+
+        if (
+            /^(fru|name|component|storage)$/i.test(
+                component
+            )
+        ) {
+
+            continue;
+        }
+
+
+        rowIndex++;
+
+
+        applyHealth(
+            state,
+            'Storage',
+            status
+        );
+
+
+        addHardwareRow(
+            '03-storage',
+            rowIndex,
+            'Storage',
+            component,
+            status,
+            'N/A',
+            'Storage',
+            'XClarity syshealth storage'
+        );
+    }
+
+
+    if (
+        rowIndex === 0
+    ) {
+
+        log(
+            'Storage parser found no component rows'
+        );
+
+
+        state.collectionProblemCount++;
+    }
+}
+
+
+/* =========================================================
+ * MEMORY PARSER
+ * ======================================================= */
+
+function parseMemory(
+    output,
+    state
+) {
+
+    logRaw(
+        'MEMORY',
+        output
+    );
+
+
+    if (
+        outputContainsCommandError(
+            output
+        )
+    ) {
+
+        log(
+            'Memory command unsupported'
+        );
+
+
+        state.collectionProblemCount++;
+
+
+        return;
+    }
+
+
+    var lines =
+        getLines(
+            output
+        );
+
+
+    var rowIndex = 0;
+
+
+    for (
+        var i = 2;
+        i < lines.length;
+        i++
+    ) {
+
+        var line =
+            lines[i].trim();
+
+
+        if (
+            isSeparatorLine(
+                line
+            )
+        ) {
+
+            continue;
+        }
+
+
+        var values =
+            line.split(
+                /\s+/
+            );
+
+
+        if (
+            values.length < 4
+        ) {
+
+            continue;
+        }
+
+
+        var capacity =
+            safeNumber(
+                values[
+                    values.length - 1
+                ],
+                null
+            );
+
+
+        if (
+            capacity === null
+        ) {
+
+            continue;
+        }
+
+
+        var type =
+            values[
+                values.length - 2
+            ];
+
+
+        var status =
+            values[
+                values.length - 3
+            ];
+
+
+        var component =
+            values
+                .slice(
+                    0,
+                    values.length - 3
+                )
+                .join(
+                    ' '
+                );
+
+
+        if (
+            component === ''
+        ) {
+
+            continue;
+        }
+
+
+        rowIndex++;
+
+
+        state.totalMemoryGB +=
+            capacity;
+
+
+        applyHealth(
+            state,
+            'Memory',
+            status
+        );
+
+
+        addHardwareRow(
+            '04-memory',
+            rowIndex,
+            'Memory',
+            component,
+            status,
+            capacity +
+            ' GB',
+            type,
+            'Capacity: ' +
+            capacity +
+            ' GB'
+        );
+    }
+
+
+    if (
+        rowIndex === 0
+    ) {
+
+        log(
+            'Memory parser found no component rows'
+        );
+
+
+        state.collectionProblemCount++;
+    }
+}
+
+
+/* =========================================================
+ * POWER PARSER
+ * ======================================================= */
+
+function parsePower(
+    output,
+    state
+) {
+
+    logRaw(
+        'POWER',
+        output
+    );
+
+
+    if (
+        outputContainsCommandError(
+            output
+        )
+    ) {
+
+        log(
+            'Power command unsupported'
+        );
+
+
+        state.collectionProblemCount++;
+
+
+        return;
+    }
+
+
+    var lines =
+        getLines(
+            output
+        );
+
+
+    var rowIndex = 0;
+
+
+    for (
+        var i = 2;
+        i < lines.length;
+        i++
+    ) {
+
+        var line =
+            lines[i].trim();
+
+
+        if (
+            isSeparatorLine(
+                line
+            )
+        ) {
+
+            continue;
+        }
+
+
+        var values =
+            line.split(
+                /\s+/
+            );
+
+
+        if (
+            values.length < 3
+        ) {
+
+            continue;
+        }
+
+
+        var ratedPower =
+            safeNumber(
+                values[
+                    values.length - 1
+                ],
+                null
+            );
+
+
+        if (
+            ratedPower === null
+        ) {
+
+            continue;
+        }
+
+
+        var status =
+            values[
+                values.length - 2
+            ];
+
+
+        var component =
+            values
+                .slice(
+                    0,
+                    values.length - 2
+                )
+                .join(
+                    ' '
+                );
+
+
+        if (
+            component === ''
+        ) {
+
+            continue;
+        }
+
+
+        rowIndex++;
+
+
+        state.totalRatedPowerWatts +=
+            ratedPower;
+
+
+        applyHealth(
+            state,
+            'Power',
+            status
+        );
+
+
+        addHardwareRow(
+            '05-power',
+            rowIndex,
+            'Power',
+            component,
+            status,
+            ratedPower +
+            ' W',
+            'Power Supply',
+            'Rated Power: ' +
+            ratedPower +
+            ' W'
+        );
+    }
+
+
+    if (
+        rowIndex === 0
+    ) {
+
+        log(
+            'Power parser found no component rows'
+        );
+
+
+        state.collectionProblemCount++;
+    }
+}
+
+
+/* =========================================================
+ * PROCESSOR PARSER
+ * ======================================================= */
+
+function parseProcessors(
+    output,
+    state
+) {
+
+    logRaw(
+        'PROCESSORS',
+        output
+    );
+
+
+    if (
+        outputContainsCommandError(
+            output
+        )
+    ) {
+
+        log(
+            'Processor command unsupported'
+        );
+
+
+        state.collectionProblemCount++;
+
+
+        return;
+    }
+
+
+    var lines =
+        getLines(
+            output
+        );
+
+
+    var rowIndex = 0;
+
+
+    for (
+        var i = 2;
+        i < lines.length;
+        i++
+    ) {
+
+        var line =
+            lines[i].trim();
+
+
+        if (
+            isSeparatorLine(
+                line
+            )
+        ) {
+
+            continue;
+        }
+
+
+        var values =
+            line.split(
+                /\s+/
+            );
+
+
+        if (
+            values.length < 3
+        ) {
+
+            continue;
+        }
+
+
+        var clockSpeed =
+            safeNumber(
+                values[
+                    values.length - 1
+                ],
+                null
+            );
+
+
+        if (
+            clockSpeed === null
+        ) {
+
+            continue;
+        }
+
+
+        var status =
+            values[
+                values.length - 2
+            ];
+
+
+        var component =
+            values
+                .slice(
+                    0,
+                    values.length - 2
+                )
+                .join(
+                    ' '
+                );
+
+
+        if (
+            component === ''
+        ) {
+
+            continue;
+        }
+
+
+        rowIndex++;
+
+
+        applyHealth(
+            state,
+            'Processor',
+            status
+        );
+
+
+        addHardwareRow(
+            '06-processor',
+            rowIndex,
+            'Processor',
+            component,
+            status,
+            clockSpeed +
+            ' MHz',
+            'Processor',
+            'Clock Speed: ' +
+            clockSpeed +
+            ' MHz'
+        );
+    }
+
+
+    if (
+        rowIndex === 0
+    ) {
+
+        log(
+            'Processor parser found no component rows'
+        );
+
+
+        state.collectionProblemCount++;
+    }
+}
+
+
+/* =========================================================
+ * TEMPERATURE HELPERS
+ * ======================================================= */
+
+function parseThreshold(value) {
+
+    if (
+        value === null ||
+        value === undefined
+    ) {
+
+        return null;
+    }
+
+
+    var number =
+        parseFloat(
+            String(value)
+        );
+
+
+    if (
+        isNaN(number)
+    ) {
+
+        return null;
+    }
+
+
+    return number;
+}
+
+
+function determineTemperatureHealth(
+    currentC,
+    warning,
+    softShutdown,
+    hardShutdown
+) {
+
+    if (
+        currentC === null
+    ) {
+
+        return 'Not Reported';
+    }
+
+
+    var warn =
+        parseThreshold(
+            warning
+        );
+
+
+    var soft =
+        parseThreshold(
+            softShutdown
+        );
+
+
+    var hard =
+        parseThreshold(
+            hardShutdown
+        );
+
+
+    if (
+        hard !== null &&
+        currentC >= hard
+    ) {
+
+        return 'Critical';
+    }
+
+
+    if (
+        soft !== null &&
+        currentC >= soft
+    ) {
+
+        return 'Critical';
+    }
+
+
+    if (
+        warn !== null &&
+        currentC >= warn
+    ) {
+
+        return 'Warning';
+    }
+
+
+    if (
+        warn !== null ||
+        soft !== null ||
+        hard !== null
+    ) {
+
+        return 'OK';
+    }
+
+
+    return 'Not Reported';
+}
+
+
+/* =========================================================
+ * TEMPERATURE PARSER
+ * ======================================================= */
+
+function parseTemperatures(
+    output,
+    state
+) {
+
+    logRaw(
+        'TEMPERATURES',
+        output
+    );
+
+
+    if (
+        outputContainsCommandError(
+            output
+        )
+    ) {
+
+        log(
+            'Temperature command unsupported'
+        );
+
+
+        state.collectionProblemCount++;
+
+
+        return;
+    }
+
+
+    var lines =
+        getLines(
+            output
+        );
+
+
+    var rowIndex = 0;
+
+
+    for (
+        var i = 3;
+        i < lines.length;
+        i++
+    ) {
+
+        var line =
+            lines[i].trim();
+
+
+        if (
+            isSeparatorLine(
+                line
+            )
+        ) {
+
+            continue;
+        }
+
+
+        var parts =
+            line.split(
+                /\s+/
+            );
+
+
+        if (
+            parts.length < 6
+        ) {
+
+            continue;
+        }
+
+
+        var warningReset =
+            parts[
+                parts.length - 5
+            ];
+
+
+        var warning =
+            parts[
+                parts.length - 4
+            ];
+
+
+        var temperatureText =
+            parts[
+                parts.length - 3
+            ];
+
+
+        var softShutdown =
+            parts[
+                parts.length - 2
+            ];
+
+
+        var hardShutdown =
+            parts[
+                parts.length - 1
+            ];
+
+
+        var temperatures =
+            String(
+                temperatureText
+            ).split(
+                '/'
+            );
+
+
+        if (
+            temperatures.length < 2
+        ) {
+
+            continue;
+        }
+
+
+        var temperatureF =
+            safeNumber(
+                temperatures[0],
+                null
+            );
+
+
+        var temperatureC =
+            safeNumber(
+                temperatures[1],
+                null
+            );
+
+
+        if (
+            temperatureF === null ||
+            temperatureC === null
+        ) {
+
+            continue;
+        }
+
+
+        var component =
+            parts
+                .slice(
+                    0,
+                    parts.length - 5
+                )
+                .join(
+                    ' '
+                );
+
+
+        if (
+            component === ''
+        ) {
+
+            continue;
+        }
+
+
+        var health =
+            determineTemperatureHealth(
+                temperatureC,
+                warning,
+                softShutdown,
+                hardShutdown
+            );
+
+
+        rowIndex++;
+
+
+        if (
+            state.highestTemperatureC === null ||
+            temperatureC >
+            state.highestTemperatureC
+        ) {
+
+            state.highestTemperatureC =
+                temperatureC;
+        }
+
+
+        applyHealth(
+            state,
+            'Temperature',
+            health
+        );
+
+
+        addHardwareRow(
+            '07-temperature',
+            rowIndex,
+            'Temperature',
+            component,
+            health,
+
+            temperatureC +
+            ' C / ' +
+            temperatureF +
+            ' F',
+
+            'Temperature Sensor',
+
+            joinDetails(
+                [
+                    'Warning Reset: ' +
+                    warningReset,
+
+                    'Warning: ' +
+                    warning,
+
+                    'Soft Shutdown: ' +
+                    softShutdown,
+
+                    'Hard Shutdown: ' +
+                    hardShutdown
+                ]
+            )
+        );
+    }
+
+
+    if (
+        rowIndex === 0
+    ) {
+
+        log(
+            'Temperature parser found no sensor rows'
+        );
+
+
+        state.collectionProblemCount++;
+    }
+}
+
+
+/* =========================================================
+ * PARSE EVERYTHING
+ * ======================================================= */
+
+function processOutputs(
+    outputs,
+    state
+) {
+
+    parseSummary(
+        outputs.summary,
+        state
+    );
+
+
+    parseCooling(
+        outputs.cooling,
+        state
+    );
+
+
+    parseStorage(
+        outputs.storage,
+        state
+    );
+
+
+    parseMemory(
+        outputs.memory,
+        state
+    );
+
+
+    parsePower(
+        outputs.power,
+        state
+    );
+
+
+    parseProcessors(
+        outputs.processors,
+        state
+    );
+
+
+    parseTemperatures(
+        outputs.temperatures,
+        state
+    );
+}
+
+
+/* =========================================================
+ * METRIC HELPERS
+ * ======================================================= */
+
+function addNumberMetric(
+    state,
+    uid,
+    name,
+    value
+) {
+
+    state.metrics.push(
+        D.createMetric(
+            {
+                uid: uid,
+
+                name: name,
+
+                value: value,
+
+                unit: '',
+
+                valueType:
+                    D.valueType.NUMBER
+            }
+        )
+    );
+}
+
+
+function addStringMetric(
+    state,
+    uid,
+    name,
+    value
+) {
+
+    state.metrics.push(
+        D.createMetric(
+            {
+                uid: uid,
+
+                name: name,
+
+                value:
+                    safeString(
+                        value,
+                        'Not Reported'
+                    ),
+
+                unit: '',
+
+                valueType:
+                    D.valueType.STRING
+            }
+        )
+    );
+}
+
+
+/* =========================================================
+ * BUILD METRICS
+ * ======================================================= */
+
+function buildMetrics(state) {
+
+    addStringMetric(
+        state,
+        'system-state',
+        'System State',
+        state.systemState
+    );
+
+
+    addStringMetric(
+        state,
+        'summary-system-health',
+        'Summary System Health',
+        state.summarySystem
+    );
+
+
+    addStringMetric(
+        state,
+        'summary-cooling-health',
+        'Summary Cooling Health',
+        state.summaryCooling
+    );
+
+
+    addStringMetric(
+        state,
+        'summary-storage-health',
+        'Summary Storage Health',
+        state.summaryStorage
+    );
+
+
+    addStringMetric(
+        state,
+        'summary-memory-health',
+        'Summary Memory Health',
+        state.summaryMemory
+    );
+
+
+    addStringMetric(
+        state,
+        'summary-processor-health',
+        'Summary Processor Health',
+        state.summaryProcessors
+    );
+
+
+    if (
+        state.restartCount !== null
+    ) {
+
+        addNumberMetric(
+            state,
+            'restart-count',
+            'Restart Count',
+            state.restartCount
+        );
+    }
+
+
+    addNumberMetric(
+        state,
+        'cooling-device-count',
+        'Cooling Device Count',
+        state.coolingCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'cooling-problem-count',
+        'Cooling Problem Count',
+        state.coolingProblemCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'cooling-unknown-count',
+        'Cooling Unknown Health Count',
+        state.coolingUnknownCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'storage-component-count',
+        'Storage Component Count',
+        state.storageCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'storage-problem-count',
+        'Storage Problem Count',
+        state.storageProblemCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'storage-unknown-count',
+        'Storage Unknown Health Count',
+        state.storageUnknownCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'memory-module-count',
+        'Memory Module Count',
+        state.memoryCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'memory-problem-count',
+        'Memory Problem Count',
+        state.memoryProblemCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'memory-unknown-count',
+        'Memory Unknown Health Count',
+        state.memoryUnknownCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'installed-memory-gb',
+        'Installed Memory GB',
+        state.totalMemoryGB
+    );
+
+
+    addNumberMetric(
+        state,
+        'power-supply-count',
+        'Power Supply Count',
+        state.powerSupplyCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'power-supply-problem-count',
+        'Power Supply Problem Count',
+        state.powerSupplyProblemCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'power-supply-unknown-count',
+        'Power Supply Unknown Health Count',
+        state.powerSupplyUnknownCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'total-rated-power-watts',
+        'Total Rated Power Watts',
+        state.totalRatedPowerWatts
+    );
+
+
+    addNumberMetric(
+        state,
+        'processor-count',
+        'Processor Count',
+        state.processorCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'processor-problem-count',
+        'Processor Problem Count',
+        state.processorProblemCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'processor-unknown-count',
+        'Processor Unknown Health Count',
+        state.processorUnknownCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'temperature-sensor-count',
+        'Temperature Sensor Count',
+        state.temperatureCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'temperature-problem-count',
+        'Temperature Problem Count',
+        state.temperatureProblemCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'temperature-unknown-count',
+        'Temperature Unknown Health Count',
+        state.temperatureUnknownCount
+    );
+
+
+    if (
+        state.highestTemperatureC !== null
+    ) {
+
+        addNumberMetric(
+            state,
+            'highest-temperature-c',
+            'Highest Temperature C',
+            state.highestTemperatureC
+        );
+    }
+
+
+    state.hardwareProblemCount =
+        state.coolingProblemCount +
+        state.storageProblemCount +
+        state.memoryProblemCount +
+        state.powerSupplyProblemCount +
+        state.processorProblemCount +
+        state.temperatureProblemCount;
+
+
+    state.unknownHealthCount =
+        state.coolingUnknownCount +
+        state.storageUnknownCount +
+        state.memoryUnknownCount +
+        state.powerSupplyUnknownCount +
+        state.processorUnknownCount +
+        state.temperatureUnknownCount;
+
+
+    addNumberMetric(
+        state,
+        'hardware-problem-count',
+        'Hardware Problem Count',
+        state.hardwareProblemCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'unknown-health-count',
+        'Unknown Hardware Health Count',
+        state.unknownHealthCount
+    );
+
+
+    addNumberMetric(
+        state,
+        'collection-problem-count',
+        'Collection Problem Count',
+        state.collectionProblemCount
+    );
+
+
+    var collectionStatus =
+        state.collectionProblemCount > 0
+            ? 'PARTIAL'
+            : 'OK';
+
+
+    addStringMetric(
+        state,
+        'collection-status',
+        'Collection Status',
+        collectionStatus
+    );
+
+
+    var hardwareStatus =
+        'OK';
+
+
+    if (
+        state.hardwareProblemCount > 0
+    ) {
+
+        hardwareStatus =
+            'Attention Required';
+
+    } else if (
+        state.unknownHealthCount > 0
+    ) {
+
+        hardwareStatus =
+            'Health Not Fully Reported';
+
+    } else if (
+        state.collectionProblemCount > 0
+    ) {
+
+        hardwareStatus =
+            'Collection Issue';
+    }
+
+
+    addStringMetric(
+        state,
+        'overall-hardware-status',
+        'Overall Hardware Status',
+        hardwareStatus
+    );
+
+
+    addStringMetric(
+        state,
+        'collection-method',
+        'Collection Method',
+        'XClarity SSH Sequential'
+    );
+}
+
+
+/* =========================================================
+ * TERMINAL FAILURE
+ * ======================================================= */
+
+function terminalFailure(error) {
+
+    var errorType =
+        error &&
+        error.type
+            ? error.type
+            : D.errorType.GENERIC_ERROR;
+
+
+    if (
+        error &&
+        error.message
+    ) {
+
+        console.error(
+            '[XCLARITY] ' +
+            error.message
+        );
+    }
+
+
+    return D.failure(
+        errorType
+    );
+}
+
+
+/* =========================================================
+ * VALIDATION
+ * ======================================================= */
+
+/**
+ * @remote_procedure
+ * @label Validate Lenovo XClarity
+ * @documentation Validates Lenovo XClarity SSH authentication and syshealth summary command execution.
+ */
+function validate() {
+
+    log(
+        '================================'
+    );
+
+
+    log(
+        'Starting XClarity validation'
+    );
+
+
+    executeCommand(
+        'syshealth summary'
+    )
+
+    .then(
+        function(output) {
+
+            if (
+                !output ||
+                String(output).trim() === ''
+            ) {
+
+                var empty =
+                    D.q.defer();
+
+
+                empty.reject(
+                    makeError(
+                        D.errorType.PARSING_ERROR,
+
+                        'syshealth summary returned no output'
+                    )
+                );
+
+
+                return empty.promise;
+            }
+
+
+            if (
+                outputContainsCommandError(
+                    output
+                )
+            ) {
+
+                var unsupported =
+                    D.q.defer();
+
+
+                unsupported.reject(
+                    makeError(
+                        D.errorType.PARSING_ERROR,
+
+                        'syshealth summary is not supported by this device'
+                    )
+                );
+
+
+                return unsupported.promise;
+            }
+
+
+            log(
+                'Validation successful'
+            );
+
+
+            return D.success();
+        }
+    )
+
+    .catch(
+        function(error) {
+
+            return terminalFailure(
+                error
+            );
+        }
+    );
+}
+
+
+/* =========================================================
+ * GET STATUS
+ * ======================================================= */
+
+/**
+ * @remote_procedure
+ * @label Get Lenovo XClarity Hardware Health
+ * @documentation Collects Lenovo XClarity system, cooling, storage, memory, power, processor, and temperature health using sequential SSH commands.
+ */
+function get_status() {
+
+    var state =
+        createState();
+
+
+    log(
+        '================================'
+    );
+
+
+    log(
+        'Starting XClarity unified hardware collection'
+    );
+
+
+    log(
+        'Transport=Sequential sendSSHCommand'
+    );
+
+
+    log(
+        'Command count=' +
+        COMMANDS.length
+    );
+
+
+    executeCommandsSequentially(
+        0,
+        {}
+    )
+
+    .then(
+        function(outputs) {
+
+            log(
+                '================================'
+            );
+
+
+            log(
+                'All SSH commands completed'
+            );
+
+
+            log(
+                'Parsing collected data'
+            );
+
+
+            processOutputs(
+                outputs,
+                state
+            );
+
+
+            buildMetrics(
+                state
+            );
+
+
+            log(
+                '--------------------------------'
+            );
+
+
+            log(
+                'Cooling devices=' +
+                state.coolingCount +
+                ' | Problems=' +
+                state.coolingProblemCount +
+                ' | Unknown=' +
+                state.coolingUnknownCount
+            );
+
+
+            log(
+                'Storage components=' +
+                state.storageCount +
+                ' | Problems=' +
+                state.storageProblemCount +
+                ' | Unknown=' +
+                state.storageUnknownCount
+            );
+
+
+            log(
+                'Memory modules=' +
+                state.memoryCount +
+                ' | Problems=' +
+                state.memoryProblemCount +
+                ' | Unknown=' +
+                state.memoryUnknownCount +
+                ' | Installed GB=' +
+                state.totalMemoryGB
+            );
+
+
+            log(
+                'Power supplies=' +
+                state.powerSupplyCount +
+                ' | Problems=' +
+                state.powerSupplyProblemCount +
+                ' | Unknown=' +
+                state.powerSupplyUnknownCount
+            );
+
+
+            log(
+                'Processors=' +
+                state.processorCount +
+                ' | Problems=' +
+                state.processorProblemCount +
+                ' | Unknown=' +
+                state.processorUnknownCount
+            );
+
+
+            log(
+                'Temperature sensors=' +
+                state.temperatureCount +
+                ' | Problems=' +
+                state.temperatureProblemCount +
+                ' | Unknown=' +
+                state.temperatureUnknownCount
+            );
+
+
+            if (
+                state.highestTemperatureC !== null
+            ) {
+
+                log(
+                    'Highest temperature=' +
+                    state.highestTemperatureC +
+                    ' C'
+                );
+            }
+
+
+            log(
+                '--------------------------------'
+            );
+
+
+            log(
+                'Hardware problems=' +
+                state.hardwareProblemCount
+            );
+
+
+            log(
+                'Unknown hardware health=' +
+                state.unknownHealthCount
+            );
+
+
+            log(
+                'Collection problems=' +
+                state.collectionProblemCount
+            );
+
+
+            log(
+                'XClarity unified hardware collection completed'
+            );
+
+
+            return D.success(
+                state.metrics,
+                hardwareTable
+            );
+        }
+    )
+
+    .catch(
+        function(error) {
+
+            return terminalFailure(
+                error
+            );
+        }
+    );
+}
